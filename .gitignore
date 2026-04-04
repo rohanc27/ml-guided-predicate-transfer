@@ -4,7 +4,6 @@
 .cargo/
 **/*.d
 
-datafusion/
 datafusion/benchmarks/data/
 datafusion/benchmarks/results/
 *.parquet
