@@ -1,0 +1,2090 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Tests for tree explain
+
+
+
+statement ok
+set datafusion.explain.format = "tree";
+
+########  Setup Data Files #######
+
+# table1: CSV
+query I
+COPY (VALUES (1, 'foo', 1, '2023-01-01'), (2, 'bar', 2, '2023-01-02'), (3, 'baz', 3, '2023-01-03'))
+TO 'test_files/scratch/explain_tree/table1.csv';
+----
+3
+
+statement ok
+CREATE EXTERNAL TABLE table1 (
+  int_col INT,
+  string_col TEXT,
+  bigint_col BIGINT,
+  date_col DATE
+)
+STORED AS CSV
+LOCATION 'test_files/scratch/explain_tree/table1.csv';
+
+# table2: Parquet
+query I
+COPY (SELECT * from table1)
+TO 'test_files/scratch/explain_tree/table2.parquet'
+----
+3
+
+statement ok
+CREATE EXTERNAL TABLE table2
+STORED AS PARQUET
+LOCATION 'test_files/scratch/explain_tree/table2.parquet';
+
+
+# table3: Memory
+statement ok
+CREATE TABLE table3 as select * from table1;
+
+# table4: JSON
+query I
+COPY (SELECT * from table1)
+TO 'test_files/scratch/explain_tree/table4.json'
+----
+3
+
+statement ok
+CREATE EXTERNAL TABLE table4
+STORED AS JSON
+LOCATION 'test_files/scratch/explain_tree/table4.json';
+
+# table5: ARROW
+query I
+COPY (SELECT * from table1)
+TO 'test_files/scratch/explain_tree/table5.arrow'
+----
+3
+
+statement ok
+CREATE EXTERNAL TABLE table5
+STORED AS ARROW
+LOCATION 'test_files/scratch/explain_tree/table5.arrow';
+
+statement ok
+CREATE UNBOUNDED EXTERNAL TABLE annotated_data_infinite2 (
+  a0 INTEGER,
+  a INTEGER,
+  b INTEGER,
+  c INTEGER,
+  d INTEGER
+)
+STORED AS CSV
+WITH ORDER (a ASC, b ASC, c ASC)
+LOCATION '../core/tests/data/window_2.csv'
+OPTIONS ('format.has_header' 'true');
+
+statement ok
+CREATE TABLE hashjoin_datatype_table_t1_source(c1 INT, c2 BIGINT, c3 DECIMAL(5,2), c4 VARCHAR)
+AS VALUES
+(1,    86400000,  1.23,    'abc'),
+(2,    172800000, 456.00,  'def'),
+(null, 259200000, 789.000, 'ghi'),
+(3,    null,      -123.12, 'jkl')
+;
+
+statement ok
+CREATE TABLE hashjoin_datatype_table_t1
+AS SELECT
+  arrow_cast(c1, 'Date32') as c1,
+  arrow_cast(c2, 'Date64') as c2,
+  c3,
+  arrow_cast(c4, 'Dictionary(Int32, Utf8)') as c4
+FROM
+  hashjoin_datatype_table_t1_source
+
+statement ok
+CREATE TABLE hashjoin_datatype_table_t2_source(c1 INT, c2 BIGINT, c3 DECIMAL(10,2), c4 VARCHAR)
+AS VALUES
+(1,    86400000,  -123.12,   'abc'),
+(null, null,      100000.00, 'abcdefg'),
+(null, 259200000, 0.00,      'qwerty'),
+(3,   null,       789.000,   'qwe')
+;
+
+statement ok
+CREATE TABLE hashjoin_datatype_table_t2
+AS SELECT
+  arrow_cast(c1, 'Date32') as c1,
+  arrow_cast(c2, 'Date64') as c2,
+  c3,
+  arrow_cast(c4, 'Dictionary(Int32, Utf8)') as c4
+FROM
+  hashjoin_datatype_table_t2_source
+
+statement ok
+CREATE UNBOUNDED EXTERNAL TABLE sink_table (
+        c1  VARCHAR NOT NULL,
+        c2  TINYINT NOT NULL,
+        c3  SMALLINT NOT NULL,
+        c4  SMALLINT NOT NULL,
+        c5  INTEGER NOT NULL,
+        c6  BIGINT NOT NULL,
+        c7  SMALLINT NOT NULL,
+        c8  INT NOT NULL,
+        c9  INT UNSIGNED NOT NULL,
+        c10 BIGINT UNSIGNED NOT NULL,
+        c11 FLOAT NOT NULL,
+        c12 DOUBLE NOT NULL,
+        c13 VARCHAR NOT NULL
+    )
+STORED AS CSV
+LOCATION '../../testing/data/csv/aggregate_test_100.csv'
+OPTIONS ('format.has_header' 'true');
+
+statement ok
+CREATE TABLE limit_table AS
+SELECT * FROM table1
+UNION ALL SELECT * FROM table1
+
+######## Begin Queries ########
+
+# Filter
+query TT
+explain SELECT int_col FROM table1 WHERE string_col != 'foo';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│     string_col != foo     │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│      RepartitionExec      │
+09)│    --------------------   │
+10)│ partition_count(in->out): │
+11)│           1 -> 4          │
+12)│                           │
+13)│    partitioning_scheme:   │
+14)│     RoundRobinBatch(4)    │
+15)└─────────────┬─────────────┘
+16)┌─────────────┴─────────────┐
+17)│       DataSourceExec      │
+18)│    --------------------   │
+19)│          files: 1         │
+20)│        format: csv        │
+21)└───────────────────────────┘
+
+# Aggregate
+query TT
+explain SELECT string_col, SUM(bigint_col) FROM table1 GROUP BY string_col;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       AggregateExec       │
+03)│    --------------------   │
+04)│           aggr:           │
+05)│   sum(table1.bigint_col)  │
+06)│                           │
+07)│    group_by: string_col   │
+08)│                           │
+09)│           mode:           │
+10)│      FinalPartitioned     │
+11)└─────────────┬─────────────┘
+12)┌─────────────┴─────────────┐
+13)│      RepartitionExec      │
+14)│    --------------------   │
+15)│ partition_count(in->out): │
+16)│           4 -> 4          │
+17)│                           │
+18)│    partitioning_scheme:   │
+19)│  Hash([string_col@0], 4)  │
+20)└─────────────┬─────────────┘
+21)┌─────────────┴─────────────┐
+22)│       AggregateExec       │
+23)│    --------------------   │
+24)│           aggr:           │
+25)│   sum(table1.bigint_col)  │
+26)│                           │
+27)│    group_by: string_col   │
+28)│       mode: Partial       │
+29)└─────────────┬─────────────┘
+30)┌─────────────┴─────────────┐
+31)│      RepartitionExec      │
+32)│    --------------------   │
+33)│ partition_count(in->out): │
+34)│           1 -> 4          │
+35)│                           │
+36)│    partitioning_scheme:   │
+37)│     RoundRobinBatch(4)    │
+38)└─────────────┬─────────────┘
+39)┌─────────────┴─────────────┐
+40)│       DataSourceExec      │
+41)│    --------------------   │
+42)│          files: 1         │
+43)│        format: csv        │
+44)└───────────────────────────┘
+
+
+# Limit
+query TT
+explain SELECT int_col FROM table1 LIMIT 3,2;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│      GlobalLimitExec      │
+03)│    --------------------   │
+04)│          limit: 2         │
+05)│          skip: 3          │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│       DataSourceExec      │
+09)│    --------------------   │
+10)│          files: 1         │
+11)│        format: csv        │
+12)└───────────────────────────┘
+
+query TT
+explain SELECT * FROM limit_table LIMIT 10;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│   CoalescePartitionsExec  │
+03)│    --------------------   │
+04)│         limit: 10         │
+05)└─────────────┬─────────────┘
+06)┌─────────────┴─────────────┐
+07)│       DataSourceExec      │
+08)│    --------------------   │
+09)│        bytes: 1024        │
+10)│       format: memory      │
+11)│          rows: 2          │
+12)└───────────────────────────┘
+
+# 2 Joins
+query TT
+EXPLAIN SELECT table1.string_col, table2.date_col
+FROM table1 
+JOIN table2 
+ON 
+  (table1.int_col = table2.int_col)
+  AND (((table1.int_col + table2.int_col) % 2) = 0)
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│     date_col: date_col    │
+05)│                           │
+06)│        string_col:        │
+07)│         string_col        │
+08)└─────────────┬─────────────┘
+09)┌─────────────┴─────────────┐
+10)│        HashJoinExec       │
+11)│    --------------------   │
+12)│          filter:          │
+13)│ CAST(int_col + int_col AS │
+14)│       Int64) % 2 = 0      ├──────────────┐
+15)│                           │              │
+16)│            on:            │              │
+17)│    (int_col = int_col)    │              │
+18)└─────────────┬─────────────┘              │
+19)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+20)│       DataSourceExec      ││      RepartitionExec      │
+21)│    --------------------   ││    --------------------   │
+22)│          files: 1         ││ partition_count(in->out): │
+23)│      format: parquet      ││           1 -> 4          │
+24)│                           ││                           │
+25)│                           ││    partitioning_scheme:   │
+26)│                           ││     RoundRobinBatch(4)    │
+27)└───────────────────────────┘└─────────────┬─────────────┘
+28)-----------------------------┌─────────────┴─────────────┐
+29)-----------------------------│       DataSourceExec      │
+30)-----------------------------│    --------------------   │
+31)-----------------------------│          files: 1         │
+32)-----------------------------│        format: csv        │
+33)-----------------------------└───────────────────────────┘
+
+# 3 Joins
+query TT
+explain SELECT
+  table1.string_col,
+  table2.date_col,
+  table3.date_col
+FROM
+  table1 JOIN table2 ON table1.int_col = table2.int_col
+         JOIN table3 ON table2.int_col = table3.int_col;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│     date_col: date_col    │
+05)│                           │
+06)│        string_col:        │
+07)│         string_col        │
+08)└─────────────┬─────────────┘
+09)┌─────────────┴─────────────┐
+10)│        HashJoinExec       │
+11)│    --------------------   │
+12)│            on:            ├──────────────┐
+13)│    (int_col = int_col)    │              │
+14)└─────────────┬─────────────┘              │
+15)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+16)│       DataSourceExec      ││       ProjectionExec      │
+17)│    --------------------   ││    --------------------   │
+18)│         bytes: 512        ││     date_col: date_col    │
+19)│       format: memory      ││      int_col: int_col     │
+20)│          rows: 1          ││                           │
+21)│                           ││        string_col:        │
+22)│                           ││         string_col        │
+23)└───────────────────────────┘└─────────────┬─────────────┘
+24)-----------------------------┌─────────────┴─────────────┐
+25)-----------------------------│        HashJoinExec       │
+26)-----------------------------│    --------------------   │
+27)-----------------------------│            on:            ├──────────────┐
+28)-----------------------------│    (int_col = int_col)    │              │
+29)-----------------------------└─────────────┬─────────────┘              │
+30)-----------------------------┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+31)-----------------------------│       DataSourceExec      ││      RepartitionExec      │
+32)-----------------------------│    --------------------   ││    --------------------   │
+33)-----------------------------│          files: 1         ││ partition_count(in->out): │
+34)-----------------------------│      format: parquet      ││           1 -> 4          │
+35)-----------------------------│                           ││                           │
+36)-----------------------------│         predicate:        ││    partitioning_scheme:   │
+37)-----------------------------│  DynamicFilter [ empty ]  ││     RoundRobinBatch(4)    │
+38)-----------------------------└───────────────────────────┘└─────────────┬─────────────┘
+39)----------------------------------------------------------┌─────────────┴─────────────┐
+40)----------------------------------------------------------│       DataSourceExec      │
+41)----------------------------------------------------------│    --------------------   │
+42)----------------------------------------------------------│          files: 1         │
+43)----------------------------------------------------------│        format: csv        │
+44)----------------------------------------------------------└───────────────────────────┘
+
+# Long Filter (demonstrate what happens with wrapping)
+query TT
+explain SELECT int_col FROM table1
+WHERE string_col != 'foo' AND string_col != 'bar' AND string_col != 'a really long string constant'
+;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│   string_col != foo AND   │
+06)│      string_col != bar    │
+07)│     AND string_col != a   │
+08)│     really long string    │
+09)│          constant         │
+10)└─────────────┬─────────────┘
+11)┌─────────────┴─────────────┐
+12)│      RepartitionExec      │
+13)│    --------------------   │
+14)│ partition_count(in->out): │
+15)│           1 -> 4          │
+16)│                           │
+17)│    partitioning_scheme:   │
+18)│     RoundRobinBatch(4)    │
+19)└─────────────┬─────────────┘
+20)┌─────────────┴─────────────┐
+21)│       DataSourceExec      │
+22)│    --------------------   │
+23)│          files: 1         │
+24)│        format: csv        │
+25)└───────────────────────────┘
+
+# Check maximum line limit.
+query TT
+explain SELECT int_col FROM table1
+WHERE string_col != 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│       string_col !=       │
+06)│        aaaaaaaaaaaa       │
+07)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+08)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+09)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+10)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+11)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+12)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+13)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+14)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+15)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+16)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+17)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+18)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+19)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+20)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+21)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+22)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+23)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+24)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+25)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+26)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+27)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+28)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+29)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+30)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+31)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+32)│aaaaaaaaaaaaaaaaaaaaaaaaaaa│
+33)│            ...            │
+34)└─────────────┬─────────────┘
+35)┌─────────────┴─────────────┐
+36)│      RepartitionExec      │
+37)│    --------------------   │
+38)│ partition_count(in->out): │
+39)│           1 -> 4          │
+40)│                           │
+41)│    partitioning_scheme:   │
+42)│     RoundRobinBatch(4)    │
+43)└─────────────┬─────────────┘
+44)┌─────────────┴─────────────┐
+45)│       DataSourceExec      │
+46)│    --------------------   │
+47)│          files: 1         │
+48)│        format: csv        │
+49)└───────────────────────────┘
+
+# Check exactly the render width.
+query TT
+explain SELECT int_col FROM table1
+WHERE string_col != 'aaaaaaaaaaaaa';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│string_col != aaaaaaaaaaaaa│
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│      RepartitionExec      │
+09)│    --------------------   │
+10)│ partition_count(in->out): │
+11)│           1 -> 4          │
+12)│                           │
+13)│    partitioning_scheme:   │
+14)│     RoundRobinBatch(4)    │
+15)└─────────────┬─────────────┘
+16)┌─────────────┴─────────────┐
+17)│       DataSourceExec      │
+18)│    --------------------   │
+19)│          files: 1         │
+20)│        format: csv        │
+21)└───────────────────────────┘
+
+# Check with the render witdth + 1.
+query TT
+explain SELECT int_col FROM table1
+WHERE string_col != 'aaaaaaaaaaaaaaa';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│       string_col !=       │
+06)│        aaaaaaaaaaaa       │
+07)│            aaa            │
+08)└─────────────┬─────────────┘
+09)┌─────────────┴─────────────┐
+10)│      RepartitionExec      │
+11)│    --------------------   │
+12)│ partition_count(in->out): │
+13)│           1 -> 4          │
+14)│                           │
+15)│    partitioning_scheme:   │
+16)│     RoundRobinBatch(4)    │
+17)└─────────────┬─────────────┘
+18)┌─────────────┴─────────────┐
+19)│       DataSourceExec      │
+20)│    --------------------   │
+21)│          files: 1         │
+22)│        format: csv        │
+23)└───────────────────────────┘
+
+# Query with filter on csv
+query TT
+explain SELECT int_col FROM table1 WHERE string_col != 'foo';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│     string_col != foo     │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│      RepartitionExec      │
+09)│    --------------------   │
+10)│ partition_count(in->out): │
+11)│           1 -> 4          │
+12)│                           │
+13)│    partitioning_scheme:   │
+14)│     RoundRobinBatch(4)    │
+15)└─────────────┬─────────────┘
+16)┌─────────────┴─────────────┐
+17)│       DataSourceExec      │
+18)│    --------------------   │
+19)│          files: 1         │
+20)│        format: csv        │
+21)└───────────────────────────┘
+
+
+# Query with filter on parquet
+query TT
+explain SELECT int_col FROM table2 WHERE string_col != 'foo';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│     string_col != foo     │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│      RepartitionExec      │
+09)│    --------------------   │
+10)│ partition_count(in->out): │
+11)│           1 -> 4          │
+12)│                           │
+13)│    partitioning_scheme:   │
+14)│     RoundRobinBatch(4)    │
+15)└─────────────┬─────────────┘
+16)┌─────────────┴─────────────┐
+17)│       DataSourceExec      │
+18)│    --------------------   │
+19)│          files: 1         │
+20)│      format: parquet      │
+21)│                           │
+22)│         predicate:        │
+23)│     string_col != foo     │
+24)└───────────────────────────┘
+
+# Query with filter on memory
+query TT
+explain SELECT int_col FROM table3 WHERE string_col != 'foo';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│     string_col != foo     │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│       DataSourceExec      │
+09)│    --------------------   │
+10)│         bytes: 512        │
+11)│       format: memory      │
+12)│          rows: 1          │
+13)└───────────────────────────┘
+
+# Query with filter on json
+query TT
+explain SELECT int_col FROM table4 WHERE string_col != 'foo';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│     string_col != foo     │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│      RepartitionExec      │
+09)│    --------------------   │
+10)│ partition_count(in->out): │
+11)│           1 -> 4          │
+12)│                           │
+13)│    partitioning_scheme:   │
+14)│     RoundRobinBatch(4)    │
+15)└─────────────┬─────────────┘
+16)┌─────────────┴─────────────┐
+17)│       DataSourceExec      │
+18)│    --------------------   │
+19)│          files: 1         │
+20)│        format: json       │
+21)└───────────────────────────┘
+
+# Query with filter on arrow
+query TT
+explain SELECT int_col FROM table5 WHERE string_col != 'foo';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         FilterExec        │
+03)│    --------------------   │
+04)│         predicate:        │
+05)│     string_col != foo     │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│      RepartitionExec      │
+09)│    --------------------   │
+10)│ partition_count(in->out): │
+11)│           1 -> 4          │
+12)│                           │
+13)│    partitioning_scheme:   │
+14)│     RoundRobinBatch(4)    │
+15)└─────────────┬─────────────┘
+16)┌─────────────┴─────────────┐
+17)│       DataSourceExec      │
+18)│    --------------------   │
+19)│          files: 1         │
+20)│       format: arrow       │
+21)└───────────────────────────┘
+
+
+# Query with window agg.
+query TT
+explain select count(*) over() from table1;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│   count(*) ROWS BETWEEN   │
+05)│     UNBOUNDED PRECEDING   │
+06)│  AND UNBOUNDED FOLLOWING: │
+07)│    count(Int64(1)) ROWS   │
+08)│      BETWEEN UNBOUNDED    │
+09)│   PRECEDING AND UNBOUNDED │
+10)│          FOLLOWING        │
+11)└─────────────┬─────────────┘
+12)┌─────────────┴─────────────┐
+13)│       WindowAggExec       │
+14)│    --------------------   │
+15)│        select_list:       │
+16)│    count(Int64(1)) ROWS   │
+17)│      BETWEEN UNBOUNDED    │
+18)│   PRECEDING AND UNBOUNDED │
+19)│          FOLLOWING        │
+20)└─────────────┬─────────────┘
+21)┌─────────────┴─────────────┐
+22)│       DataSourceExec      │
+23)│    --------------------   │
+24)│          files: 1         │
+25)│        format: csv        │
+26)└───────────────────────────┘
+
+# Query with bounded window agg.
+query TT
+explain SELECT
+    v1,
+    SUM(v1) OVER (ORDER BY v1 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS rolling_sum
+FROM generate_series(1, 1000) AS t1(v1);
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│        rolling_sum:       │
+05)│ sum(t1.v1) ORDER BY [t1.v1│
+06)│    ASC NULLS LAST] ROWS   │
+07)│     BETWEEN 1 PRECEDING   │
+08)│       AND CURRENT ROW     │
+09)│                           │
+10)│           v1: v1          │
+11)└─────────────┬─────────────┘
+12)┌─────────────┴─────────────┐
+13)│    BoundedWindowAggExec   │
+14)│    --------------------   │
+15)│        mode: Sorted       │
+16)│                           │
+17)│        select_list:       │
+18)│ sum(t1.v1) ORDER BY [t1.v1│
+19)│    ASC NULLS LAST] ROWS   │
+20)│     BETWEEN 1 PRECEDING   │
+21)│       AND CURRENT ROW     │
+22)└─────────────┬─────────────┘
+23)┌─────────────┴─────────────┐
+24)│          SortExec         │
+25)│    --------------------   │
+26)│    v1@0 ASC NULLS LAST    │
+27)└─────────────┬─────────────┘
+28)┌─────────────┴─────────────┐
+29)│       ProjectionExec      │
+30)│    --------------------   │
+31)│         v1: value         │
+32)└─────────────┬─────────────┘
+33)┌─────────────┴─────────────┐
+34)│       LazyMemoryExec      │
+35)│    --------------------   │
+36)│     batch_generators:     │
+37)│ generate_series: start=1, │
+38)│    end=1000, batch_size   │
+39)│           =8192           │
+40)└───────────────────────────┘
+
+query TT
+explain select 
+  count(*) over(),
+  row_number() over ()
+from table1
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│   count(*) ROWS BETWEEN   │
+05)│     UNBOUNDED PRECEDING   │
+06)│  AND UNBOUNDED FOLLOWING: │
+07)│    count(Int64(1)) ROWS   │
+08)│      BETWEEN UNBOUNDED    │
+09)│   PRECEDING AND UNBOUNDED │
+10)│          FOLLOWING        │
+11)│                           │
+12)│ row_number() ROWS BETWEEN │
+13)│   UNBOUNDED PRECEDING AND │
+14)│    UNBOUNDED FOLLOWING:   │
+15)│ row_number() ROWS BETWEEN │
+16)│   UNBOUNDED PRECEDING AND │
+17)│     UNBOUNDED FOLLOWING   │
+18)└─────────────┬─────────────┘
+19)┌─────────────┴─────────────┐
+20)│       WindowAggExec       │
+21)│    --------------------   │
+22)│        select_list:       │
+23)│    count(Int64(1)) ROWS   │
+24)│      BETWEEN UNBOUNDED    │
+25)│   PRECEDING AND UNBOUNDED │
+26)│   FOLLOWING, row_number() │
+27)│   ROWS BETWEEN UNBOUNDED  │
+28)│   PRECEDING AND UNBOUNDED │
+29)│          FOLLOWING        │
+30)└─────────────┬─────────────┘
+31)┌─────────────┴─────────────┐
+32)│       DataSourceExec      │
+33)│    --------------------   │
+34)│          files: 1         │
+35)│        format: csv        │
+36)└───────────────────────────┘
+
+# Query for sort.
+query TT
+explain SELECT * FROM table1 ORDER BY string_col;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│          SortExec         │
+03)│    --------------------   │
+04)│string_col@1 ASC NULLS LAST│
+05)└─────────────┬─────────────┘
+06)┌─────────────┴─────────────┐
+07)│       DataSourceExec      │
+08)│    --------------------   │
+09)│          files: 1         │
+10)│        format: csv        │
+11)└───────────────────────────┘
+
+# Query for sort with limit.
+query TT
+explain SELECT * FROM table1 ORDER BY string_col LIMIT 1;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       SortExec(TopK)      │
+03)│    --------------------   │
+04)│          limit: 1         │
+05)│                           │
+06)│string_col@1 ASC NULLS LAST│
+07)└─────────────┬─────────────┘
+08)┌─────────────┴─────────────┐
+09)│       DataSourceExec      │
+10)│    --------------------   │
+11)│          files: 1         │
+12)│        format: csv        │
+13)└───────────────────────────┘
+
+# Query with projection on csv
+query TT
+explain SELECT int_col, bigint_col, int_col+bigint_col AS sum_col FROM table1;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│        bigint_col:        │
+05)│         bigint_col        │
+06)│                           │
+07)│      int_col: int_col     │
+08)│                           │
+09)│          sum_col:         │
+10)│  CAST(int_col AS Int64) + │
+11)│         bigint_col        │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│      RepartitionExec      │
+15)│    --------------------   │
+16)│ partition_count(in->out): │
+17)│           1 -> 4          │
+18)│                           │
+19)│    partitioning_scheme:   │
+20)│     RoundRobinBatch(4)    │
+21)└─────────────┬─────────────┘
+22)┌─────────────┴─────────────┐
+23)│       DataSourceExec      │
+24)│    --------------------   │
+25)│          files: 1         │
+26)│        format: csv        │
+27)└───────────────────────────┘
+
+query TT
+explain select 
+  rank() over(ORDER BY int_col DESC),
+  row_number() over (ORDER BY int_col ASC)
+from table1
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│  rank() ORDER BY [table1  │
+05)│    .int_col DESC NULLS    │
+06)│    FIRST] RANGE BETWEEN   │
+07)│   UNBOUNDED PRECEDING AND │
+08)│        CURRENT ROW:       │
+09)│  rank() ORDER BY [table1  │
+10)│    .int_col DESC NULLS    │
+11)│    FIRST] RANGE BETWEEN   │
+12)│   UNBOUNDED PRECEDING AND │
+13)│         CURRENT ROW       │
+14)│                           │
+15)│   row_number() ORDER BY   │
+16)│    [table1.int_col ASC    │
+17)│      NULLS LAST] RANGE    │
+18)│      BETWEEN UNBOUNDED    │
+19)│    PRECEDING AND CURRENT  │
+20)│            ROW:           │
+21)│   row_number() ORDER BY   │
+22)│    [table1.int_col ASC    │
+23)│      NULLS LAST] RANGE    │
+24)│      BETWEEN UNBOUNDED    │
+25)│    PRECEDING AND CURRENT  │
+26)│             ROW           │
+27)└─────────────┬─────────────┘
+28)┌─────────────┴─────────────┐
+29)│    BoundedWindowAggExec   │
+30)│    --------------------   │
+31)│        mode: Sorted       │
+32)│                           │
+33)│        select_list:       │
+34)│   row_number() ORDER BY   │
+35)│    [table1.int_col ASC    │
+36)│      NULLS LAST] RANGE    │
+37)│      BETWEEN UNBOUNDED    │
+38)│    PRECEDING AND CURRENT  │
+39)│             ROW           │
+40)└─────────────┬─────────────┘
+41)┌─────────────┴─────────────┐
+42)│          SortExec         │
+43)│    --------------------   │
+44)│  int_col@0 ASC NULLS LAST │
+45)└─────────────┬─────────────┘
+46)┌─────────────┴─────────────┐
+47)│    BoundedWindowAggExec   │
+48)│    --------------------   │
+49)│        mode: Sorted       │
+50)│                           │
+51)│        select_list:       │
+52)│  rank() ORDER BY [table1  │
+53)│    .int_col DESC NULLS    │
+54)│    FIRST] RANGE BETWEEN   │
+55)│   UNBOUNDED PRECEDING AND │
+56)│         CURRENT ROW       │
+57)└─────────────┬─────────────┘
+58)┌─────────────┴─────────────┐
+59)│          SortExec         │
+60)│    --------------------   │
+61)│       int_col@0 DESC      │
+62)└─────────────┬─────────────┘
+63)┌─────────────┴─────────────┐
+64)│       DataSourceExec      │
+65)│    --------------------   │
+66)│          files: 1         │
+67)│        format: csv        │
+68)└───────────────────────────┘
+
+# Query with projection on parquet
+query TT
+explain SELECT int_col, bigint_col, int_col+bigint_col AS sum_col FROM table2;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       DataSourceExec      │
+03)│    --------------------   │
+04)│          files: 1         │
+05)│      format: parquet      │
+06)└───────────────────────────┘
+
+# Query with projection on memory
+query TT
+explain SELECT int_col, bigint_col, int_col+bigint_col AS sum_col FROM table3;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│        bigint_col:        │
+05)│         bigint_col        │
+06)│                           │
+07)│      int_col: int_col     │
+08)│                           │
+09)│          sum_col:         │
+10)│  CAST(int_col AS Int64) + │
+11)│         bigint_col        │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│       DataSourceExec      │
+15)│    --------------------   │
+16)│         bytes: 512        │
+17)│       format: memory      │
+18)│          rows: 1          │
+19)└───────────────────────────┘
+
+# Query with projection on json
+query TT
+explain SELECT int_col, bigint_col, int_col+bigint_col AS sum_col FROM table4;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│        bigint_col:        │
+05)│         bigint_col        │
+06)│                           │
+07)│      int_col: int_col     │
+08)│                           │
+09)│          sum_col:         │
+10)│    int_col + bigint_col   │
+11)└─────────────┬─────────────┘
+12)┌─────────────┴─────────────┐
+13)│      RepartitionExec      │
+14)│    --------------------   │
+15)│ partition_count(in->out): │
+16)│           1 -> 4          │
+17)│                           │
+18)│    partitioning_scheme:   │
+19)│     RoundRobinBatch(4)    │
+20)└─────────────┬─────────────┘
+21)┌─────────────┴─────────────┐
+22)│       DataSourceExec      │
+23)│    --------------------   │
+24)│          files: 1         │
+25)│        format: json       │
+26)└───────────────────────────┘
+
+
+# Query with projection on arrow
+query TT
+explain SELECT int_col, bigint_col, int_col+bigint_col AS sum_col FROM table5;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│        bigint_col:        │
+05)│         bigint_col        │
+06)│                           │
+07)│      int_col: int_col     │
+08)│                           │
+09)│          sum_col:         │
+10)│  CAST(int_col AS Int64) + │
+11)│         bigint_col        │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│      RepartitionExec      │
+15)│    --------------------   │
+16)│ partition_count(in->out): │
+17)│           1 -> 4          │
+18)│                           │
+19)│    partitioning_scheme:   │
+20)│     RoundRobinBatch(4)    │
+21)└─────────────┬─────────────┘
+22)┌─────────────┴─────────────┐
+23)│       DataSourceExec      │
+24)│    --------------------   │
+25)│          files: 1         │
+26)│       format: arrow       │
+27)└───────────────────────────┘
+
+# Query with PartialSortExec.
+query TT
+EXPLAIN SELECT *
+FROM annotated_data_infinite2
+ORDER BY a, b, d;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│      PartialSortExec      │
+03)│    --------------------   │
+04)│  a@1 ASC NULLS LAST, b@2  │
+05)│     ASC NULLS LAST, d@4   │
+06)│       ASC NULLS LAST      │
+07)└─────────────┬─────────────┘
+08)┌─────────────┴─────────────┐
+09)│     StreamingTableExec    │
+10)│    --------------------   │
+11)│       infinite: true      │
+12)│        limit: None        │
+13)└───────────────────────────┘
+
+query TT
+EXPLAIN SELECT *
+FROM annotated_data_infinite2
+ORDER BY a, b, d
+LIMIT 50;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│      PartialSortExec      │
+03)│    --------------------   │
+04)│  a@1 ASC NULLS LAST, b@2  │
+05)│     ASC NULLS LAST, d@4   │
+06)│       ASC NULLS LAST      │
+07)│                           │
+08)│         limit: 50         │
+09)└─────────────┬─────────────┘
+10)┌─────────────┴─────────────┐
+11)│     StreamingTableExec    │
+12)│    --------------------   │
+13)│       infinite: true      │
+14)│        limit: None        │
+15)└───────────────────────────┘
+
+# Query with hash join.
+query TT
+explain select * from table1 inner join table2 on table1.int_col = table2.int_col and table1.string_col = table2.string_col;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│        bigint_col:        │
+05)│         bigint_col        │
+06)│                           │
+07)│     date_col: date_col    │
+08)│      int_col: int_col     │
+09)│                           │
+10)│        string_col:        │
+11)│         string_col        │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│        HashJoinExec       │
+15)│    --------------------   │
+16)│            on:            │
+17)│   (int_col = int_col),    ├──────────────┐
+18)│       (string_col =       │              │
+19)│         string_col)       │              │
+20)└─────────────┬─────────────┘              │
+21)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+22)│       DataSourceExec      ││      RepartitionExec      │
+23)│    --------------------   ││    --------------------   │
+24)│          files: 1         ││ partition_count(in->out): │
+25)│      format: parquet      ││           1 -> 4          │
+26)│                           ││                           │
+27)│                           ││    partitioning_scheme:   │
+28)│                           ││     RoundRobinBatch(4)    │
+29)└───────────────────────────┘└─────────────┬─────────────┘
+30)-----------------------------┌─────────────┴─────────────┐
+31)-----------------------------│       DataSourceExec      │
+32)-----------------------------│    --------------------   │
+33)-----------------------------│          files: 1         │
+34)-----------------------------│        format: csv        │
+35)-----------------------------└───────────────────────────┘
+
+# Query with outer hash join.
+query TT
+explain select * from table1 left outer join table2 on table1.int_col = table2.int_col and table1.string_col = table2.string_col;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│        bigint_col:        │
+05)│         bigint_col        │
+06)│                           │
+07)│     date_col: date_col    │
+08)│      int_col: int_col     │
+09)│                           │
+10)│        string_col:        │
+11)│         string_col        │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│        HashJoinExec       │
+15)│    --------------------   │
+16)│      join_type: Right     │
+17)│                           │
+18)│            on:            ├──────────────┐
+19)│   (int_col = int_col),    │              │
+20)│       (string_col =       │              │
+21)│         string_col)       │              │
+22)└─────────────┬─────────────┘              │
+23)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+24)│       DataSourceExec      ││      RepartitionExec      │
+25)│    --------------------   ││    --------------------   │
+26)│          files: 1         ││ partition_count(in->out): │
+27)│      format: parquet      ││           1 -> 4          │
+28)│                           ││                           │
+29)│                           ││    partitioning_scheme:   │
+30)│                           ││     RoundRobinBatch(4)    │
+31)└───────────────────────────┘└─────────────┬─────────────┘
+32)-----------------------------┌─────────────┴─────────────┐
+33)-----------------------------│       DataSourceExec      │
+34)-----------------------------│    --------------------   │
+35)-----------------------------│          files: 1         │
+36)-----------------------------│        format: csv        │
+37)-----------------------------└───────────────────────────┘
+
+# Query with nested loop join.
+query TT
+explain select int_col from table1 where exists (select count(*) from table2);
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│     NestedLoopJoinExec    │
+03)│    --------------------   ├──────────────┐
+04)│    join_type: LeftSemi    │              │
+05)└─────────────┬─────────────┘              │
+06)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+07)│       DataSourceExec      ││     PlaceholderRowExec    │
+08)│    --------------------   ││                           │
+09)│          files: 1         ││                           │
+10)│        format: csv        ││                           │
+11)└───────────────────────────┘└───────────────────────────┘
+
+# Query with cross join.
+query TT
+explain select * from table1 cross join table2 ;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       CrossJoinExec       ├──────────────┐
+03)└─────────────┬─────────────┘              │
+04)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+05)│       DataSourceExec      ││       DataSourceExec      │
+06)│    --------------------   ││    --------------------   │
+07)│          files: 1         ││          files: 1         │
+08)│        format: csv        ││      format: parquet      │
+09)└───────────────────────────┘└───────────────────────────┘
+
+# Query with sort merge join.
+statement ok
+set datafusion.optimizer.prefer_hash_join = false;
+
+query TT
+explain select * from hashjoin_datatype_table_t1 t1 join hashjoin_datatype_table_t2 t2 on t1.c1 = t2.c1
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│     SortMergeJoinExec     │
+03)│    --------------------   ├──────────────┐
+04)│       on: (c1 = c1)       │              │
+05)└─────────────┬─────────────┘              │
+06)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+07)│          SortExec         ││          SortExec         │
+08)│    --------------------   ││    --------------------   │
+09)│          c1@0 ASC         ││          c1@0 ASC         │
+10)└─────────────┬─────────────┘└─────────────┬─────────────┘
+11)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+12)│       DataSourceExec      ││       DataSourceExec      │
+13)│    --------------------   ││    --------------------   │
+14)│        bytes: 5932        ││        bytes: 5932        │
+15)│       format: memory      ││       format: memory      │
+16)│          rows: 1          ││          rows: 1          │
+17)└───────────────────────────┘└───────────────────────────┘
+
+statement ok
+set datafusion.optimizer.prefer_hash_join = true;
+
+# cleanup
+statement ok
+drop table table1;
+
+statement ok
+drop table table2;
+
+statement ok
+drop table table3;
+
+statement ok
+drop table table4;
+
+statement ok
+drop table table5;
+
+# Create table for InterleaveExec
+statement ok
+CREATE TABLE t1(
+  id INT,
+  name TEXT
+) as VALUES
+  (1, 'Alex'),
+  (2, 'Bob'),
+  (3, 'Alice')
+;
+
+statement ok
+CREATE TABLE t2(
+  id TINYINT,
+  name TEXT
+) as VALUES
+  (1, 'Alex'),
+  (2, 'Bob'),
+  (3, 'John')
+;
+
+# Test explain tree for InterleaveExec
+query TT
+EXPLAIN
+SELECT count(*) FROM (
+    SELECT distinct name FROM t1
+    UNION ALL
+    SELECT distinct name FROM t2
+) GROUP BY name
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│         count(*):         │
+05)│      count(Int64(1))      │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│       AggregateExec       │
+09)│    --------------------   │
+10)│       aggr: count(1)      │
+11)│       group_by: name      │
+12)│                           │
+13)│           mode:           │
+14)│     SinglePartitioned     │
+15)└─────────────┬─────────────┘
+16)┌─────────────┴─────────────┐
+17)│       InterleaveExec      ├──────────────┐
+18)└─────────────┬─────────────┘              │
+19)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+20)│       AggregateExec       ││       AggregateExec       │
+21)│    --------------------   ││    --------------------   │
+22)│       group_by: name      ││       group_by: name      │
+23)│                           ││                           │
+24)│           mode:           ││           mode:           │
+25)│      FinalPartitioned     ││      FinalPartitioned     │
+26)└─────────────┬─────────────┘└─────────────┬─────────────┘
+27)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+28)│      RepartitionExec      ││      RepartitionExec      │
+29)│    --------------------   ││    --------------------   │
+30)│ partition_count(in->out): ││ partition_count(in->out): │
+31)│           1 -> 4          ││           1 -> 4          │
+32)│                           ││                           │
+33)│    partitioning_scheme:   ││    partitioning_scheme:   │
+34)│     Hash([name@0], 4)     ││     Hash([name@0], 4)     │
+35)└─────────────┬─────────────┘└─────────────┬─────────────┘
+36)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+37)│       AggregateExec       ││       AggregateExec       │
+38)│    --------------------   ││    --------------------   │
+39)│       group_by: name      ││       group_by: name      │
+40)│       mode: Partial       ││       mode: Partial       │
+41)└─────────────┬─────────────┘└─────────────┬─────────────┘
+42)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+43)│       DataSourceExec      ││       DataSourceExec      │
+44)│    --------------------   ││    --------------------   │
+45)│         bytes: 288        ││         bytes: 280        │
+46)│       format: memory      ││       format: memory      │
+47)│          rows: 1          ││          rows: 1          │
+48)└───────────────────────────┘└───────────────────────────┘
+
+# Test explain tree for UnionExec
+query TT
+EXPLAIN
+SELECT id, name FROM t1
+UNION ALL
+SELECT id, name FROM t2;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│         UnionExec         ├──────────────┐
+03)└─────────────┬─────────────┘              │
+04)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+05)│       DataSourceExec      ││       ProjectionExec      │
+06)│    --------------------   ││    --------------------   │
+07)│         bytes: 288        ││   id: CAST(id AS Int32)   │
+08)│       format: memory      ││         name: name        │
+09)│          rows: 1          ││                           │
+10)└───────────────────────────┘└─────────────┬─────────────┘
+11)-----------------------------┌─────────────┴─────────────┐
+12)-----------------------------│       DataSourceExec      │
+13)-----------------------------│    --------------------   │
+14)-----------------------------│         bytes: 280        │
+15)-----------------------------│       format: memory      │
+16)-----------------------------│          rows: 1          │
+17)-----------------------------└───────────────────────────┘
+
+# cleanup
+statement ok
+drop table t1;
+
+statement ok
+drop table t2;
+
+# Test on StreamingTableExec
+# prepare table
+statement ok
+CREATE UNBOUNDED EXTERNAL TABLE data (
+    "date"   DATE, 
+    "ticker" VARCHAR, 
+    "time"   TIMESTAMP,
+) STORED AS CSV
+WITH ORDER ("date", "ticker", "time")
+LOCATION './a.parquet';
+
+
+# query
+query TT
+explain SELECT * FROM data 
+WHERE ticker = 'A' 
+ORDER BY "date", "time";
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│  SortPreservingMergeExec  │
+03)│    --------------------   │
+04)│ date ASC NULLS LAST, time │
+05)│       ASC NULLS LAST      │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│         FilterExec        │
+09)│    --------------------   │
+10)│   predicate: ticker = A   │
+11)└─────────────┬─────────────┘
+12)┌─────────────┴─────────────┐
+13)│      RepartitionExec      │
+14)│    --------------------   │
+15)│ partition_count(in->out): │
+16)│           1 -> 4          │
+17)│                           │
+18)│    partitioning_scheme:   │
+19)│     RoundRobinBatch(4)    │
+20)└─────────────┬─────────────┘
+21)┌─────────────┴─────────────┐
+22)│     StreamingTableExec    │
+23)│    --------------------   │
+24)│       infinite: true      │
+25)│        limit: None        │
+26)└───────────────────────────┘
+
+
+# constant ticker, CAST(time AS DATE) = time, order by time
+query TT
+explain SELECT * FROM data
+WHERE ticker = 'A' AND CAST(time AS DATE) = date
+ORDER BY "time"
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│  SortPreservingMergeExec  │
+03)│    --------------------   │
+04)│    time ASC NULLS LAST    │
+05)└─────────────┬─────────────┘
+06)┌─────────────┴─────────────┐
+07)│         FilterExec        │
+08)│    --------------------   │
+09)│         predicate:        │
+10)│  ticker = A AND CAST(time │
+11)│      AS Date32) = date    │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│      RepartitionExec      │
+15)│    --------------------   │
+16)│ partition_count(in->out): │
+17)│           1 -> 4          │
+18)│                           │
+19)│    partitioning_scheme:   │
+20)│     RoundRobinBatch(4)    │
+21)└─────────────┬─────────────┘
+22)┌─────────────┴─────────────┐
+23)│     StreamingTableExec    │
+24)│    --------------------   │
+25)│       infinite: true      │
+26)│        limit: None        │
+27)└───────────────────────────┘
+
+# same thing but order by date
+query TT
+explain SELECT * FROM data
+WHERE ticker = 'A' AND CAST(time AS DATE) = date
+ORDER BY "date"
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│  SortPreservingMergeExec  │
+03)│    --------------------   │
+04)│    date ASC NULLS LAST    │
+05)└─────────────┬─────────────┘
+06)┌─────────────┴─────────────┐
+07)│         FilterExec        │
+08)│    --------------------   │
+09)│         predicate:        │
+10)│  ticker = A AND CAST(time │
+11)│      AS Date32) = date    │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│      RepartitionExec      │
+15)│    --------------------   │
+16)│ partition_count(in->out): │
+17)│           1 -> 4          │
+18)│                           │
+19)│    partitioning_scheme:   │
+20)│     RoundRobinBatch(4)    │
+21)└─────────────┬─────────────┘
+22)┌─────────────┴─────────────┐
+23)│     StreamingTableExec    │
+24)│    --------------------   │
+25)│       infinite: true      │
+26)│        limit: None        │
+27)└───────────────────────────┘
+
+# same thing but order by ticker
+query TT
+explain SELECT * FROM data
+WHERE ticker = 'A' AND CAST(time AS DATE) = date
+ORDER BY "ticker"
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│   CoalescePartitionsExec  │
+03)└─────────────┬─────────────┘
+04)┌─────────────┴─────────────┐
+05)│         FilterExec        │
+06)│    --------------------   │
+07)│         predicate:        │
+08)│  ticker = A AND CAST(time │
+09)│      AS Date32) = date    │
+10)└─────────────┬─────────────┘
+11)┌─────────────┴─────────────┐
+12)│      RepartitionExec      │
+13)│    --------------------   │
+14)│ partition_count(in->out): │
+15)│           1 -> 4          │
+16)│                           │
+17)│    partitioning_scheme:   │
+18)│     RoundRobinBatch(4)    │
+19)└─────────────┬─────────────┘
+20)┌─────────────┴─────────────┐
+21)│     StreamingTableExec    │
+22)│    --------------------   │
+23)│       infinite: true      │
+24)│        limit: None        │
+25)└───────────────────────────┘
+
+
+# same thing but order by time, date
+query TT
+explain SELECT * FROM data 
+WHERE ticker = 'A' AND CAST(time AS DATE) = date
+ORDER BY "time", "date";
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│  SortPreservingMergeExec  │
+03)│    --------------------   │
+04)│ time ASC NULLS LAST, date │
+05)│       ASC NULLS LAST      │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│         FilterExec        │
+09)│    --------------------   │
+10)│         predicate:        │
+11)│  ticker = A AND CAST(time │
+12)│      AS Date32) = date    │
+13)└─────────────┬─────────────┘
+14)┌─────────────┴─────────────┐
+15)│      RepartitionExec      │
+16)│    --------------------   │
+17)│ partition_count(in->out): │
+18)│           1 -> 4          │
+19)│                           │
+20)│    partitioning_scheme:   │
+21)│     RoundRobinBatch(4)    │
+22)└─────────────┬─────────────┘
+23)┌─────────────┴─────────────┐
+24)│     StreamingTableExec    │
+25)│    --------------------   │
+26)│       infinite: true      │
+27)│        limit: None        │
+28)└───────────────────────────┘
+
+
+
+# query
+query TT
+explain SELECT * FROM data 
+WHERE date = '2006-01-02'
+ORDER BY "ticker", "time"
+LIMIT 5;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│  SortPreservingMergeExec  │
+03)│    --------------------   │
+04)│          limit: 5         │
+05)│                           │
+06)│   ticker ASC NULLS LAST,  │
+07)│     time ASC NULLS LAST   │
+08)└─────────────┬─────────────┘
+09)┌─────────────┴─────────────┐
+10)│         FilterExec        │
+11)│    --------------------   │
+12)│          fetch: 5         │
+13)│                           │
+14)│         predicate:        │
+15)│     date = 2006-01-02     │
+16)└─────────────┬─────────────┘
+17)┌─────────────┴─────────────┐
+18)│      RepartitionExec      │
+19)│    --------------------   │
+20)│ partition_count(in->out): │
+21)│           1 -> 4          │
+22)│                           │
+23)│    partitioning_scheme:   │
+24)│     RoundRobinBatch(4)    │
+25)└─────────────┬─────────────┘
+26)┌─────────────┴─────────────┐
+27)│     StreamingTableExec    │
+28)│    --------------------   │
+29)│       infinite: true      │
+30)│        limit: None        │
+31)└───────────────────────────┘
+
+
+
+
+# query
+query TT
+explain SELECT * FROM data 
+WHERE date = '2006-01-02' 
+ORDER BY "ticker", "time";
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│  SortPreservingMergeExec  │
+03)│    --------------------   │
+04)│   ticker ASC NULLS LAST,  │
+05)│     time ASC NULLS LAST   │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│         FilterExec        │
+09)│    --------------------   │
+10)│         predicate:        │
+11)│     date = 2006-01-02     │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│      RepartitionExec      │
+15)│    --------------------   │
+16)│ partition_count(in->out): │
+17)│           1 -> 4          │
+18)│                           │
+19)│    partitioning_scheme:   │
+20)│     RoundRobinBatch(4)    │
+21)└─────────────┬─────────────┘
+22)┌─────────────┴─────────────┐
+23)│     StreamingTableExec    │
+24)│    --------------------   │
+25)│       infinite: true      │
+26)│        limit: None        │
+27)└───────────────────────────┘
+
+
+
+# Test explain tree for WorkTableExec
+query TT
+EXPLAIN WITH RECURSIVE nodes AS (
+    SELECT 1 as id
+    UNION ALL
+    SELECT id + 1 as id
+    FROM nodes
+    WHERE id < 10
+)
+SELECT * FROM nodes
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│     RecursiveQueryExec    ├──────────────┐
+03)└─────────────┬─────────────┘              │
+04)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+05)│       ProjectionExec      ││   CoalescePartitionsExec  │
+06)│    --------------------   ││                           │
+07)│           id: 1           ││                           │
+08)└─────────────┬─────────────┘└─────────────┬─────────────┘
+09)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+10)│     PlaceholderRowExec    ││       ProjectionExec      │
+11)│                           ││    --------------------   │
+12)│                           ││         id: id + 1        │
+13)└───────────────────────────┘└─────────────┬─────────────┘
+14)-----------------------------┌─────────────┴─────────────┐
+15)-----------------------------│         FilterExec        │
+16)-----------------------------│    --------------------   │
+17)-----------------------------│     predicate: id < 10    │
+18)-----------------------------└─────────────┬─────────────┘
+19)-----------------------------┌─────────────┴─────────────┐
+20)-----------------------------│      RepartitionExec      │
+21)-----------------------------│    --------------------   │
+22)-----------------------------│ partition_count(in->out): │
+23)-----------------------------│           1 -> 4          │
+24)-----------------------------│                           │
+25)-----------------------------│    partitioning_scheme:   │
+26)-----------------------------│     RoundRobinBatch(4)    │
+27)-----------------------------└─────────────┬─────────────┘
+28)-----------------------------┌─────────────┴─────────────┐
+29)-----------------------------│       WorkTableExec       │
+30)-----------------------------│    --------------------   │
+31)-----------------------------│        name: nodes        │
+32)-----------------------------└───────────────────────────┘
+
+query TT
+explain COPY (VALUES (1, 'foo', 1, '2023-01-01'), (2, 'bar', 2, '2023-01-02'), (3, 'baz', 3, '2023-01-03'))
+TO 'test_files/scratch/explain_tree/1.json';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│        DataSinkExec       │
+03)│    --------------------   │
+04)│           file:           │
+05)│     test_files/scratch    │
+06)│      /explain_tree/1      │
+07)│           .json           │
+08)│                           │
+09)│        format: json       │
+10)└─────────────┬─────────────┘
+11)┌─────────────┴─────────────┐
+12)│       DataSourceExec      │
+13)│    --------------------   │
+14)│        bytes: 2576        │
+15)│       format: memory      │
+16)│          rows: 1          │
+17)└───────────────────────────┘
+
+query TT
+explain COPY (VALUES (1, 'foo', 1, '2023-01-01'), (2, 'bar', 2, '2023-01-02'), (3, 'baz', 3, '2023-01-03'))
+TO 'test_files/scratch/explain_tree/2.csv';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│        DataSinkExec       │
+03)│    --------------------   │
+04)│           file:           │
+05)│     test_files/scratch    │
+06)│      /explain_tree/2      │
+07)│            .csv           │
+08)│                           │
+09)│        format: csv        │
+10)└─────────────┬─────────────┘
+11)┌─────────────┴─────────────┐
+12)│       DataSourceExec      │
+13)│    --------------------   │
+14)│        bytes: 2576        │
+15)│       format: memory      │
+16)│          rows: 1          │
+17)└───────────────────────────┘
+
+query TT
+explain COPY (VALUES (1, 'foo', 1, '2023-01-01'), (2, 'bar', 2, '2023-01-02'), (3, 'baz', 3, '2023-01-03'))
+TO 'test_files/scratch/explain_tree/3.arrow';
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│        DataSinkExec       │
+03)│    --------------------   │
+04)│           file:           │
+05)│     test_files/scratch    │
+06)│      /explain_tree/3      │
+07)│           .arrow          │
+08)│                           │
+09)│       format: arrow       │
+10)└─────────────┬─────────────┘
+11)┌─────────────┴─────────────┐
+12)│       DataSourceExec      │
+13)│    --------------------   │
+14)│        bytes: 2576        │
+15)│       format: memory      │
+16)│          rows: 1          │
+17)└───────────────────────────┘
+
+
+# Test explain tree rendering for CoalesceBatchesExec with limit
+statement ok
+CREATE TABLE IF NOT EXISTS t1 (a INT) AS VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+
+query TT
+EXPLAIN SELECT COUNT(*) FROM (SELECT a FROM t1 WHERE a > 3 LIMIT 3 OFFSET 6);
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│         count(*):         │
+05)│      count(Int64(1))      │
+06)└─────────────┬─────────────┘
+07)┌─────────────┴─────────────┐
+08)│       AggregateExec       │
+09)│    --------------------   │
+10)│       aggr: count(1)      │
+11)│        mode: Final        │
+12)└─────────────┬─────────────┘
+13)┌─────────────┴─────────────┐
+14)│   CoalescePartitionsExec  │
+15)└─────────────┬─────────────┘
+16)┌─────────────┴─────────────┐
+17)│       AggregateExec       │
+18)│    --------------------   │
+19)│       aggr: count(1)      │
+20)│       mode: Partial       │
+21)└─────────────┬─────────────┘
+22)┌─────────────┴─────────────┐
+23)│      RepartitionExec      │
+24)│    --------------------   │
+25)│ partition_count(in->out): │
+26)│           1 -> 4          │
+27)│                           │
+28)│    partitioning_scheme:   │
+29)│     RoundRobinBatch(4)    │
+30)└─────────────┬─────────────┘
+31)┌─────────────┴─────────────┐
+32)│       ProjectionExec      │
+33)└─────────────┬─────────────┘
+34)┌─────────────┴─────────────┐
+35)│      GlobalLimitExec      │
+36)│    --------------------   │
+37)│          limit: 3         │
+38)│          skip: 6          │
+39)└─────────────┬─────────────┘
+40)┌─────────────┴─────────────┐
+41)│         FilterExec        │
+42)│    --------------------   │
+43)│          fetch: 9         │
+44)│      predicate: a > 3     │
+45)└─────────────┬─────────────┘
+46)┌─────────────┴─────────────┐
+47)│       DataSourceExec      │
+48)│    --------------------   │
+49)│         bytes: 160        │
+50)│       format: memory      │
+51)│          rows: 1          │
+52)└───────────────────────────┘
+
+# clean up
+statement ok
+drop table t1;
+
+# Test explain tree for LazyMemoryExec
+query TT
+EXPLAIN SELECT * FROM generate_series(1, 100)
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       LazyMemoryExec      │
+03)│    --------------------   │
+04)│     batch_generators:     │
+05)│ generate_series: start=1, │
+06)│  end=100, batch_size=8192 │
+07)└───────────────────────────┘
+
+# Test explain tree for CoalescePartitionsExec
+query TT
+EXPLAIN SELECT c1, c2, c3 FROM sink_table WHERE c3 > 0 LIMIT 5;
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│   CoalescePartitionsExec  │
+03)│    --------------------   │
+04)│          limit: 5         │
+05)└─────────────┬─────────────┘
+06)┌─────────────┴─────────────┐
+07)│         FilterExec        │
+08)│    --------------------   │
+09)│          fetch: 5         │
+10)│     predicate: c3 > 0     │
+11)└─────────────┬─────────────┘
+12)┌─────────────┴─────────────┐
+13)│      RepartitionExec      │
+14)│    --------------------   │
+15)│ partition_count(in->out): │
+16)│           1 -> 4          │
+17)│                           │
+18)│    partitioning_scheme:   │
+19)│     RoundRobinBatch(4)    │
+20)└─────────────┬─────────────┘
+21)┌─────────────┴─────────────┐
+22)│     StreamingTableExec    │
+23)│    --------------------   │
+24)│       infinite: true      │
+25)│        limit: None        │
+26)└───────────────────────────┘
+
+# Test explain tree for PlaceholderRowExec
+query TT
+EXPLAIN select count(*) from (values ('a', 'b'), ('c', 'd')) as t (c1, c2)
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       ProjectionExec      │
+03)│    --------------------   │
+04)│        count(*): 2        │
+05)└─────────────┬─────────────┘
+06)┌─────────────┴─────────────┐
+07)│     PlaceholderRowExec    │
+08)└───────────────────────────┘
+
+
+# Test explain for large plans
+
+statement ok
+CREATE TABLE t (k int)
+
+# By default, the plan of this large query is cropped
+query TT
+EXPLAIN SELECT * FROM t t1, t t2, t t3, t t4, t t5, t t6, t t7, t t8, t t9, t t10 
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       CrossJoinExec       ├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+03)└─────────────┬─────────────┘                                                                                                                                                                                                                                        
+04)┌─────────────┴─────────────┐                                                                                                                                                                                                                                        
+05)│       CrossJoinExec       │                                                                                                                                                                                                                                        
+06)│                           │                                                                                                                                                                                                                                        
+07)│                           ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐              
+08)│                           │                                                                                                                                                                                                                         │              
+09)│                           │                                                                                                                                                                                                                         │              
+10)└─────────────┬─────────────┘                                                                                                                                                                                                                         │              
+11)┌─────────────┴─────────────┐                                                                                                                                                                                                           ┌─────────────┴─────────────┐
+12)│       CrossJoinExec       │                                                                                                                                                                                                           │       DataSourceExec      │
+13)│                           │                                                                                                                                                                                                           │    --------------------   │
+14)│                           ├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+15)│                           │                                                                                                                                                                                            │              │       format: memory      │
+16)│                           │                                                                                                                                                                                            │              │          rows: 0          │
+17)└─────────────┬─────────────┘                                                                                                                                                                                            │              └───────────────────────────┘
+18)┌─────────────┴─────────────┐                                                                                                                                                                              ┌─────────────┴─────────────┐
+19)│       CrossJoinExec       │                                                                                                                                                                              │       DataSourceExec      │
+20)│                           │                                                                                                                                                                              │    --------------------   │
+21)│                           ├───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+22)│                           │                                                                                                                                                               │              │       format: memory      │
+23)│                           │                                                                                                                                                               │              │          rows: 0          │
+24)└─────────────┬─────────────┘                                                                                                                                                               │              └───────────────────────────┘
+25)┌─────────────┴─────────────┐                                                                                                                                                 ┌─────────────┴─────────────┐
+26)│       CrossJoinExec       │                                                                                                                                                 │       DataSourceExec      │
+27)│                           │                                                                                                                                                 │    --------------------   │
+28)│                           ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+29)│                           │                                                                                                                                  │              │       format: memory      │
+30)│                           │                                                                                                                                  │              │          rows: 0          │
+31)└─────────────┬─────────────┘                                                                                                                                  │              └───────────────────────────┘
+32)┌─────────────┴─────────────┐                                                                                                                    ┌─────────────┴─────────────┐
+33)│       CrossJoinExec       │                                                                                                                    │       DataSourceExec      │
+34)│                           │                                                                                                                    │    --------------------   │
+35)│                           ├─────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+36)│                           │                                                                                                     │              │       format: memory      │
+37)│                           │                                                                                                     │              │          rows: 0          │
+38)└─────────────┬─────────────┘                                                                                                     │              └───────────────────────────┘
+39)┌─────────────┴─────────────┐                                                                                       ┌─────────────┴─────────────┐
+40)│       CrossJoinExec       │                                                                                       │       DataSourceExec      │
+41)│                           │                                                                                       │    --------------------   │
+42)│                           ├────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+43)│                           │                                                                        │              │       format: memory      │
+44)│                           │                                                                        │              │          rows: 0          │
+45)└─────────────┬─────────────┘                                                                        │              └───────────────────────────┘
+46)┌─────────────┴─────────────┐                                                          ┌─────────────┴─────────────┐
+47)│       CrossJoinExec       │                                                          │       DataSourceExec      │
+48)│                           │                                                          │    --------------------   │
+49)│                           ├───────────────────────────────────────────┐              │          bytes: 0         │
+50)│                           │                                           │              │       format: memory      │
+51)│                           │                                           │              │          rows: 0          │
+52)└─────────────┬─────────────┘                                           │              └───────────────────────────┘
+53)┌─────────────┴─────────────┐                             ┌─────────────┴─────────────┐
+54)│       CrossJoinExec       │                             │       DataSourceExec      │
+55)│                           │                             │    --------------------   │
+56)│                           ├──────────────┐              │          bytes: 0         │
+57)│                           │              │              │       format: memory      │
+58)│                           │              │              │          rows: 0          │
+59)└─────────────┬─────────────┘              │              └───────────────────────────┘
+60)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+61)│       DataSourceExec      ││       DataSourceExec      │
+62)│    --------------------   ││    --------------------   │
+63)│          bytes: 0         ││          bytes: 0         │
+64)│       format: memory      ││       format: memory      │
+65)│          rows: 0          ││          rows: 0          │
+66)└───────────────────────────┘└───────────────────────────┘
+
+# Setting the tree_maximum_render_size to 0 will allow the entire plan to be rendered
+statement ok
+SET datafusion.explain.tree_maximum_render_width = 0
+
+query TT
+EXPLAIN SELECT * FROM t t1, t t2, t t3, t t4, t t5, t t6, t t7, t t8, t t9, t t10 
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       CrossJoinExec       ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+03)└─────────────┬─────────────┘                                                                                                                                                                                                                                                      │
+04)┌─────────────┴─────────────┐                                                                                                                                                                                                                                        ┌─────────────┴─────────────┐
+05)│       CrossJoinExec       │                                                                                                                                                                                                                                        │       DataSourceExec      │
+06)│                           │                                                                                                                                                                                                                                        │    --------------------   │
+07)│                           ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+08)│                           │                                                                                                                                                                                                                         │              │       format: memory      │
+09)│                           │                                                                                                                                                                                                                         │              │          rows: 0          │
+10)└─────────────┬─────────────┘                                                                                                                                                                                                                         │              └───────────────────────────┘
+11)┌─────────────┴─────────────┐                                                                                                                                                                                                           ┌─────────────┴─────────────┐
+12)│       CrossJoinExec       │                                                                                                                                                                                                           │       DataSourceExec      │
+13)│                           │                                                                                                                                                                                                           │    --------------------   │
+14)│                           ├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+15)│                           │                                                                                                                                                                                            │              │       format: memory      │
+16)│                           │                                                                                                                                                                                            │              │          rows: 0          │
+17)└─────────────┬─────────────┘                                                                                                                                                                                            │              └───────────────────────────┘
+18)┌─────────────┴─────────────┐                                                                                                                                                                              ┌─────────────┴─────────────┐
+19)│       CrossJoinExec       │                                                                                                                                                                              │       DataSourceExec      │
+20)│                           │                                                                                                                                                                              │    --------------------   │
+21)│                           ├───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+22)│                           │                                                                                                                                                               │              │       format: memory      │
+23)│                           │                                                                                                                                                               │              │          rows: 0          │
+24)└─────────────┬─────────────┘                                                                                                                                                               │              └───────────────────────────┘
+25)┌─────────────┴─────────────┐                                                                                                                                                 ┌─────────────┴─────────────┐
+26)│       CrossJoinExec       │                                                                                                                                                 │       DataSourceExec      │
+27)│                           │                                                                                                                                                 │    --------------------   │
+28)│                           ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+29)│                           │                                                                                                                                  │              │       format: memory      │
+30)│                           │                                                                                                                                  │              │          rows: 0          │
+31)└─────────────┬─────────────┘                                                                                                                                  │              └───────────────────────────┘
+32)┌─────────────┴─────────────┐                                                                                                                    ┌─────────────┴─────────────┐
+33)│       CrossJoinExec       │                                                                                                                    │       DataSourceExec      │
+34)│                           │                                                                                                                    │    --------------------   │
+35)│                           ├─────────────────────────────────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+36)│                           │                                                                                                     │              │       format: memory      │
+37)│                           │                                                                                                     │              │          rows: 0          │
+38)└─────────────┬─────────────┘                                                                                                     │              └───────────────────────────┘
+39)┌─────────────┴─────────────┐                                                                                       ┌─────────────┴─────────────┐
+40)│       CrossJoinExec       │                                                                                       │       DataSourceExec      │
+41)│                           │                                                                                       │    --------------------   │
+42)│                           ├────────────────────────────────────────────────────────────────────────┐              │          bytes: 0         │
+43)│                           │                                                                        │              │       format: memory      │
+44)│                           │                                                                        │              │          rows: 0          │
+45)└─────────────┬─────────────┘                                                                        │              └───────────────────────────┘
+46)┌─────────────┴─────────────┐                                                          ┌─────────────┴─────────────┐
+47)│       CrossJoinExec       │                                                          │       DataSourceExec      │
+48)│                           │                                                          │    --------------------   │
+49)│                           ├───────────────────────────────────────────┐              │          bytes: 0         │
+50)│                           │                                           │              │       format: memory      │
+51)│                           │                                           │              │          rows: 0          │
+52)└─────────────┬─────────────┘                                           │              └───────────────────────────┘
+53)┌─────────────┴─────────────┐                             ┌─────────────┴─────────────┐
+54)│       CrossJoinExec       │                             │       DataSourceExec      │
+55)│                           │                             │    --------------------   │
+56)│                           ├──────────────┐              │          bytes: 0         │
+57)│                           │              │              │       format: memory      │
+58)│                           │              │              │          rows: 0          │
+59)└─────────────┬─────────────┘              │              └───────────────────────────┘
+60)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+61)│       DataSourceExec      ││       DataSourceExec      │
+62)│    --------------------   ││    --------------------   │
+63)│          bytes: 0         ││          bytes: 0         │
+64)│       format: memory      ││       format: memory      │
+65)│          rows: 0          ││          rows: 0          │
+66)└───────────────────────────┘└───────────────────────────┘
+
+# Setting the tree_maximum_render_size to a smaller size
+statement ok
+SET datafusion.explain.tree_maximum_render_width = 60
+
+query TT
+EXPLAIN SELECT * FROM t t1, t t2, t t3, t t4, t t5, t t6, t t7, t t8, t t9, t t10 
+----
+physical_plan
+01)┌───────────────────────────┐
+02)│       CrossJoinExec       ├──────────────────────────────────────────────────────────        
+03)└─────────────┬─────────────┘
+04)┌─────────────┴─────────────┐
+05)│       CrossJoinExec       │
+06)│                           │
+07)│                           ├──────────────────────────────────────────────────────────        
+08)│                           │
+09)│                           │
+10)└─────────────┬─────────────┘
+11)┌─────────────┴─────────────┐
+12)│       CrossJoinExec       │
+13)│                           │
+14)│                           ├──────────────────────────────────────────────────────────        
+15)│                           │
+16)│                           │
+17)└─────────────┬─────────────┘
+18)┌─────────────┴─────────────┐
+19)│       CrossJoinExec       │
+20)│                           │
+21)│                           ├──────────────────────────────────────────────────────────        
+22)│                           │
+23)│                           │
+24)└─────────────┬─────────────┘
+25)┌─────────────┴─────────────┐
+26)│       CrossJoinExec       │
+27)│                           │
+28)│                           ├──────────────────────────────────────────────────────────        
+29)│                           │
+30)│                           │
+31)└─────────────┬─────────────┘
+32)┌─────────────┴─────────────┐
+33)│       CrossJoinExec       │
+34)│                           │
+35)│                           ├──────────────────────────────────────────────────────────        
+36)│                           │
+37)│                           │
+38)└─────────────┬─────────────┘
+39)┌─────────────┴─────────────┐
+40)│       CrossJoinExec       │
+41)│                           │
+42)│                           ├──────────────────────────────────────────────────────────        
+43)│                           │
+44)│                           │
+45)└─────────────┬─────────────┘
+46)┌─────────────┴─────────────┐
+47)│       CrossJoinExec       │
+48)│                           │
+49)│                           ├───────────────────────────────────────────┐
+50)│                           │                                           │
+51)│                           │                                           │
+52)└─────────────┬─────────────┘                                           │
+53)┌─────────────┴─────────────┐                             ┌─────────────┴─────────────┐        
+54)│       CrossJoinExec       │                             │       DataSourceExec      │        
+55)│                           │                             │    --------------------   │        
+56)│                           ├──────────────┐              │          bytes: 0         │        
+57)│                           │              │              │       format: memory      │        
+58)│                           │              │              │          rows: 0          │        
+59)└─────────────┬─────────────┘              │              └───────────────────────────┘        
+60)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+61)│       DataSourceExec      ││       DataSourceExec      │
+62)│    --------------------   ││    --------------------   │
+63)│          bytes: 0         ││          bytes: 0         │
+64)│       format: memory      ││       format: memory      │
+65)│          rows: 0          ││          rows: 0          │
+66)└───────────────────────────┘└───────────────────────────┘
+
+statement ok
+DROP TABLE t
+
+# Config reset
+statement ok
+RESET datafusion.explain.format;
+
+statement ok
+RESET datafusion.explain.tree_maximum_render_width;

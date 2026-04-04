@@ -1,0 +1,86 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+name = "datafusion-proto"
+description = "Protobuf serialization of DataFusion logical plan expressions"
+keywords = ["arrow", "query", "sql"]
+readme = "README.md"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "datafusion_proto"
+
+[features]
+default = ["parquet"]
+json = ["pbjson", "serde", "serde_json", "datafusion-proto-common/json"]
+parquet = ["datafusion-datasource-parquet", "datafusion-common/parquet", "datafusion/parquet"]
+avro = ["datafusion-datasource-avro"]
+
+# Note to developers: do *not* add `datafusion` as a dependency in
+# this crate. See https://github.com/apache/datafusion/issues/17713
+# for additional information.
+
+[dependencies]
+arrow = { workspace = true }
+chrono = { workspace = true }
+datafusion-catalog = { workspace = true }
+datafusion-catalog-listing = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-datasource = { workspace = true }
+datafusion-datasource-arrow = { workspace = true }
+datafusion-datasource-avro = { workspace = true, optional = true }
+datafusion-datasource-csv = { workspace = true }
+datafusion-datasource-json = { workspace = true }
+datafusion-datasource-parquet = { workspace = true, optional = true }
+datafusion-execution = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-functions-table = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+datafusion-physical-expr-common = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+datafusion-proto-common = { workspace = true }
+object_store = { workspace = true }
+pbjson = { workspace = true, optional = true }
+prost = { workspace = true }
+rand = { workspace = true }
+serde = { version = "1.0", optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+datafusion = { workspace = true, default-features = false, features = [
+    "sql",
+    "datetime_expressions",
+    "nested_expressions",
+    "unicode_expressions",
+] }
+datafusion-functions = { workspace = true, default-features = true }
+datafusion-functions-aggregate = { workspace = true }
+datafusion-functions-window-common = { workspace = true }
+doc-comment = { workspace = true }
+pretty_assertions = "1.4"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
