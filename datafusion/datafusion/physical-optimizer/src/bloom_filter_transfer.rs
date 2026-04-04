@@ -25,7 +25,7 @@ use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use bloomfilter::Bloom;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DataFusionError, JoinType, Result};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::PhysicalExpr;
@@ -320,6 +320,85 @@ impl ExecutionPlan for BloomFilterProbeExec {
     }
 }
 
+// Plan Rewriting
+
+fn insert_bloom_filters(
+    plan: Arc<dyn ExecutionPlan>,
+    edges: &[JoinEdge],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if edges.is_empty() {
+        return Ok(plan);
+    }
+
+    if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if *hash_join.join_type() == JoinType::Inner {
+            let left = Arc::clone(hash_join.left());
+            let right = Arc::clone(hash_join.right());
+
+            let left = insert_bloom_filters(left, edges)?;
+            let right = insert_bloom_filters(right, edges)?;
+
+            let mut new_left = left;
+            let mut new_right = right;
+
+            for (join_left_expr, join_right_expr) in hash_join.on() {
+                let left_col_name = format!("{}", join_left_expr);
+                let right_col_name = format!("{}", join_right_expr);
+
+                let left_schema = new_left.schema();
+                let right_schema = new_right.schema();
+
+                let left_col_idx = left_schema
+                    .fields()
+                    .iter()
+                    .position(|f| left_col_name.contains(f.name()));
+
+                let right_col_idx = right_schema
+                    .fields()
+                    .iter()
+                    .position(|f| right_col_name.contains(f.name()));
+
+                if let (Some(l_idx), Some(r_idx)) = (left_col_idx, right_col_idx) {
+                    let shared_bloom: SharedBloom =
+                        Arc::new(Mutex::new(None));
+
+                    new_left = Arc::new(BloomFilterBuildExec::new(
+                        new_left,
+                        l_idx,
+                        Arc::clone(&shared_bloom),
+                    ));
+
+                    new_right = Arc::new(BloomFilterProbeExec::new(
+                        new_right,
+                        r_idx,
+                        Arc::clone(&shared_bloom),
+                    ));
+
+                    println!(
+                        "  inserted BF: build on col {} (idx {}), probe on col {} (idx {})",
+                        left_col_name, l_idx, right_col_name, r_idx
+                    );
+                }
+            }
+
+            let new_plan = plan.with_new_children(vec![new_left, new_right])?;
+            return Ok(new_plan);
+        }
+    }
+
+    let children = plan.children();
+    if children.is_empty() {
+        return Ok(plan);
+    }
+
+    let new_children = children
+        .into_iter()
+        .map(|c| insert_bloom_filters(Arc::clone(c), edges))
+        .collect::<Result<Vec<_>>>()?;
+
+    plan.with_new_children(new_children)
+}
+
 // Optimizer Rule Implementation
 
 impl PhysicalOptimizerRule for MultiHopBloomFilterRule {
@@ -335,7 +414,11 @@ impl PhysicalOptimizerRule for MultiHopBloomFilterRule {
             println!("  edge: {} = {}", edge.left_col, edge.right_col);
         }
 
-        plan.transform_up(|node| Ok(Transformed::no(node))).map(|t| t.data)
+        if edges.is_empty() {
+            return Ok(plan);
+        }
+
+        insert_bloom_filters(plan, &edges)
     }
 
     fn name(&self) -> &str {
