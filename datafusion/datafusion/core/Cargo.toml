@@ -297,3 +297,6 @@ required-features = ["parquet"]
 [[bench]]
 harness = false
 name = "reset_plan_states"
+
+[[example]]
+name = "bloom_filter_demo"
