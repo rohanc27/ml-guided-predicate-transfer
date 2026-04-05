@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-
+use datafusion::physical_optimizer::bloom_filter_transfer::MultiHopBloomFilterRule;
 use super::{
     TPCH_QUERY_END_ID, TPCH_QUERY_START_ID, TPCH_TABLES, get_query_sql,
     get_tbl_tpch_table_schema, get_tpch_table_schema,
@@ -130,7 +130,13 @@ impl RunOpt {
         config.options_mut().execution.hash_join_buffering_capacity =
             self.hash_join_buffering_capacity;
         let rt = self.common.build_runtime()?;
-        let ctx = SessionContext::new_with_config_rt(config, rt);
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(rt)
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(MultiHopBloomFilterRule::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
         // register tables
         self.register_tables(&ctx).await?;
 
