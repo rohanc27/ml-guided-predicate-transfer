@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! multi-hop predicate transfer via runtime bloom filters.
+//! Multi-hop predicate transfer via runtime Bloom filters.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -91,17 +91,17 @@ fn collect_recursive(plan: &Arc<dyn ExecutionPlan>, edges: &mut Vec<JoinEdge>) {
 #[derive(Debug)]
 pub struct BloomFilterBuildExec {
     input: Arc<dyn ExecutionPlan>,
-    key_column: usize,
+    key_column_name: String,
     bloom: SharedBloom,
 }
 
 impl BloomFilterBuildExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        key_column: usize,
+        key_column_name: String,
         bloom: SharedBloom,
     ) -> Self {
-        Self { input, key_column, bloom }
+        Self { input, key_column_name, bloom }
     }
 
     pub fn bloom(&self) -> SharedBloom {
@@ -115,7 +115,7 @@ impl DisplayAs for BloomFilterBuildExec {
         _t: DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "BloomFilterBuildExec: key_col={}", self.key_column)
+        write!(f, "BloomFilterBuildExec: key_col={}", self.key_column_name)
     }
 }
 
@@ -142,7 +142,7 @@ impl ExecutionPlan for BloomFilterBuildExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(BloomFilterBuildExec::new(
             Arc::clone(&children[0]),
-            self.key_column,
+            self.key_column_name.clone(),
             Arc::clone(&self.bloom),
         )))
     }
@@ -152,10 +152,18 @@ impl ExecutionPlan for BloomFilterBuildExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let schema = self.input.schema();
+        let key_column = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == &self.key_column_name)
+            .ok_or_else(|| DataFusionError::Plan(
+                format!("BloomFilterBuildExec: column '{}' not found in schema", self.key_column_name)
+            ))?;
+
         let mut input_stream = self.input.execute(partition, context)?;
         let bloom = Arc::clone(&self.bloom);
-        let key_column = self.key_column;
-        let schema = self.input.schema();
+        let schema_ref = self.input.schema();
 
         let output_stream = async_stream::stream! {
             while let Some(batch_result) = input_stream.next().await {
@@ -189,7 +197,7 @@ impl ExecutionPlan for BloomFilterBuildExec {
             }
         };
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, output_stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema_ref, output_stream)))
     }
 
     fn apply_expressions(
@@ -205,17 +213,17 @@ impl ExecutionPlan for BloomFilterBuildExec {
 #[derive(Debug)]
 pub struct BloomFilterProbeExec {
     input: Arc<dyn ExecutionPlan>,
-    key_column: usize,
+    key_column_name: String,
     bloom: SharedBloom,
 }
 
 impl BloomFilterProbeExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        key_column: usize,
+        key_column_name: String,
         bloom: SharedBloom,
     ) -> Self {
-        Self { input, key_column, bloom }
+        Self { input, key_column_name, bloom }
     }
 }
 
@@ -225,7 +233,7 @@ impl DisplayAs for BloomFilterProbeExec {
         _t: DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "BloomFilterProbeExec: key_col={}", self.key_column)
+        write!(f, "BloomFilterProbeExec: key_col={}", self.key_column_name)
     }
 }
 
@@ -252,7 +260,7 @@ impl ExecutionPlan for BloomFilterProbeExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(BloomFilterProbeExec::new(
             Arc::clone(&children[0]),
-            self.key_column,
+            self.key_column_name.clone(),
             Arc::clone(&self.bloom),
         )))
     }
@@ -262,10 +270,19 @@ impl ExecutionPlan for BloomFilterProbeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let schema = self.input.schema();
+        let key_column = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == &self.key_column_name)
+            .ok_or_else(|| DataFusionError::Plan(
+                format!("BloomFilterProbeExec: column '{}' not found in schema", self.key_column_name)
+            ))?;
+
         let mut input_stream = self.input.execute(partition, context)?;
         let bloom = Arc::clone(&self.bloom);
-        let key_column = self.key_column;
-        let schema = self.input.schema();
+        let schema_ref = self.input.schema();
+        let key_column_name = self.key_column_name.clone();
 
         let output_stream = async_stream::stream! {
             while let Some(batch_result) = input_stream.next().await {
@@ -300,16 +317,29 @@ impl ExecutionPlan for BloomFilterProbeExec {
                     }
                 };
 
+                let rows_before = batch.num_rows();
                 let mask = BooleanArray::from(keep);
                 match filter_record_batch(&batch, &mask) {
-                    Ok(filtered) => yield Ok(filtered),
+                    Ok(filtered) => {
+                        let rows_after = filtered.num_rows();
+                        let eliminated = rows_before - rows_after;
+                        if eliminated > 0 {
+                            println!(
+                                "  [BloomFilterProbeExec] col='{}' eliminated {}/{} rows ({:.1}%)",
+                                key_column_name,
+                                eliminated,
+                                rows_before,
+                                (eliminated as f64 / rows_before as f64) * 100.0
+                            );
+                        }
+                        yield Ok(filtered)
+                    },
                     Err(e) => yield Err(DataFusionError::ArrowError(Box::new(e), None)),
-
                 }
             }
         };
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, output_stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema_ref, output_stream)))
     }
 
     fn apply_expressions(
@@ -348,35 +378,38 @@ fn insert_bloom_filters(
                 let left_schema = new_left.schema();
                 let right_schema = new_right.schema();
 
-                let left_col_idx = left_schema
+                let left_field_name = left_schema
                     .fields()
                     .iter()
-                    .position(|f| left_col_name.contains(f.name()));
+                    .find(|f| left_col_name.contains(f.name()))
+                    .map(|f| f.name().clone());
 
-                let right_col_idx = right_schema
+                let right_field_name = right_schema
                     .fields()
                     .iter()
-                    .position(|f| right_col_name.contains(f.name()));
+                    .find(|f| right_col_name.contains(f.name()))
+                    .map(|f| f.name().clone());
 
-                if let (Some(l_idx), Some(r_idx)) = (left_col_idx, right_col_idx) {
-                    let shared_bloom: SharedBloom =
-                        Arc::new(Mutex::new(None));
+                if let (Some(left_field_name), Some(right_field_name)) =
+                    (left_field_name, right_field_name)
+                {
+                    let shared_bloom: SharedBloom = Arc::new(Mutex::new(None));
 
                     new_left = Arc::new(BloomFilterBuildExec::new(
                         new_left,
-                        l_idx,
+                        left_field_name.clone(),
                         Arc::clone(&shared_bloom),
                     ));
 
                     new_right = Arc::new(BloomFilterProbeExec::new(
                         new_right,
-                        r_idx,
+                        right_field_name.clone(),
                         Arc::clone(&shared_bloom),
                     ));
 
                     println!(
-                        "  inserted BF: build on col {} (idx {}), probe on col {} (idx {})",
-                        left_col_name, l_idx, right_col_name, r_idx
+                        "  inserted BF: build on col '{}', probe on col '{}'",
+                        left_field_name, right_field_name
                     );
                 }
             }

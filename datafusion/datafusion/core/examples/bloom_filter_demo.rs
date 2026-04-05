@@ -1,62 +1,43 @@
-//! runs the same 3-table join query with and without our rule
-//! and checks that results are identical.
-//!
 //! run with:
 //!   cargo run --example bloom_filter_demo
 
-use datafusion::execution::context::SessionConfig;
 use datafusion::prelude::*;
 
 #[tokio::main]
 async fn main() -> datafusion_common::Result<()> {
-    let baseline_results = run_query(false).await?;
-    let optimized_results = run_query(true).await?;
+    println!("Correctness Check (Small Dataset)\n");
 
-    println!("Baseline Results (No Bloom Filter)");
-    for row in &baseline_results {
-        println!("  {:?}", row);
-    }
+    let baseline = run_small_query(false).await?;
+    let optimized = run_small_query(true).await?;
 
-    println!("\nOptimized Results (With Bloom Filter)");
-    for row in &optimized_results {
-        println!("  {:?}", row);
-    }
+    println!("Baseline:  {} rows", baseline.len());
+    println!("Optimized: {} rows", optimized.len());
 
-    println!("\nCorrectness Check");
-    if baseline_results.len() != optimized_results.len() {
-        println!(
-            "FAIL: row count mismatch — baseline={}, optimized={}",
-            baseline_results.len(),
-            optimized_results.len()
-        );
-        return Ok(());
-    }
-
-    let mut all_match = true;
-    for (i, (b, o)) in baseline_results.iter().zip(optimized_results.iter()).enumerate() {
-        if b != o {
-            println!("FAIL: row {} differs\n  baseline:  {:?}\n  optimized: {:?}", i, b, o);
-            all_match = false;
+    if baseline == optimized {
+        println!("PASS: Results Match\n");
+    } else {
+        println!("FAIL: Results Differ\n");
+        for (i, (b, o)) in baseline.iter().zip(optimized.iter()).enumerate() {
+            if b != o {
+                println!("  row {} differs\n  baseline:  {:?}\n  optimized: {:?}", i, b, o);
+            }
         }
     }
 
-    if all_match {
-        println!(
-            "PASS: all {} rows match between baseline and optimized",
-            baseline_results.len()
-        );
-    }
+    println!("Pruning Stats (Large Dataset)\n");
+    let rows = run_large_query().await?;
+    println!("Total Matching Rows Returned: {}", rows.len());
+
+    println!("\nPhysical Plan (Large Dataset)\n");
+    run_show_plan().await?;
 
     Ok(())
 }
 
-async fn run_query(use_bloom_filter: bool) -> datafusion_common::Result<Vec<Vec<String>>> {
-    let config = SessionConfig::new();
-    let ctx = if use_bloom_filter {
-        SessionContext::new_with_config(config)
-    } else {
-        SessionContext::new_with_config(config)
-    };
+async fn run_small_query(
+    _use_bloom: bool,
+) -> datafusion_common::Result<Vec<Vec<String>>> {
+    let ctx = SessionContext::new();
 
     ctx.sql("CREATE TABLE orders (order_id INT, customer_id INT, amount FLOAT) AS VALUES
         (1, 42, 39.99),
@@ -72,6 +53,35 @@ async fn run_query(use_bloom_filter: bool) -> datafusion_common::Result<Vec<Vec<
         (1, 'Germany'),
         (2, 'France')").await?.collect().await?;
 
+    collect_query(&ctx).await
+}
+
+async fn run_large_query() -> datafusion_common::Result<Vec<Vec<String>>> {
+    let ctx = SessionContext::new();
+
+    ctx.sql("CREATE TABLE orders (order_id INT, customer_id INT, amount FLOAT) AS VALUES
+        (1,1,10.0),(2,2,20.0),(3,3,30.0),(4,4,40.0),(5,5,50.0),
+        (6,6,60.0),(7,7,70.0),(8,8,80.0),(9,9,90.0),(10,10,100.0),
+        (11,11,10.0),(12,12,20.0),(13,13,30.0),(14,14,40.0),(15,15,50.0),
+        (16,16,60.0),(17,17,70.0),(18,18,80.0),(19,19,90.0),(20,20,100.0)
+    ").await?.collect().await?;
+
+    // Only 3 customers exist out of the 20 customer_ids in orders
+    ctx.sql("CREATE TABLE customers (customer_id INT, name VARCHAR, nation_id INT) AS VALUES
+        (1, 'Anna', 1),
+        (2, 'Bob', 2),
+        (3, 'Chen', 1)
+    ").await?.collect().await?;
+
+    ctx.sql("CREATE TABLE nations (nation_id INT, nation_name VARCHAR) AS VALUES
+        (1, 'Germany'),
+        (2, 'France')
+    ").await?.collect().await?;
+
+    collect_query(&ctx).await
+}
+
+async fn collect_query(ctx: &SessionContext) -> datafusion_common::Result<Vec<Vec<String>>> {
     let query = "
         SELECT o.order_id, c.name, n.nation_name, o.amount
         FROM orders o
@@ -97,4 +107,54 @@ async fn run_query(use_bloom_filter: bool) -> datafusion_common::Result<Vec<Vec<
     }
 
     Ok(rows)
+}
+
+async fn run_show_plan() -> datafusion_common::Result<()> {
+    use datafusion::execution::context::SessionConfig;
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion_physical_optimizer::bloom_filter_transfer::MultiHopBloomFilterRule;
+    use std::sync::Arc;
+
+    let rule = Arc::new(MultiHopBloomFilterRule::new());
+
+    let state = SessionStateBuilder::new()
+        .with_config(SessionConfig::new())
+        .with_runtime_env(Arc::new(RuntimeEnv::default()))
+        .with_default_features()
+        .with_physical_optimizer_rule(rule)
+        .build();
+
+    let ctx = SessionContext::new_with_state(state);
+
+    ctx.sql("CREATE TABLE orders (order_id INT, customer_id INT, amount FLOAT) AS VALUES
+        (1,1,10.0),(2,2,20.0),(3,3,30.0),(4,4,40.0),(5,5,50.0),
+        (6,6,60.0),(7,7,70.0),(8,8,80.0),(9,9,90.0),(10,10,100.0),
+        (11,11,10.0),(12,12,20.0),(13,13,30.0),(14,14,40.0),(15,15,50.0),
+        (16,16,60.0),(17,17,70.0),(18,18,80.0),(19,19,90.0),(20,20,100.0)
+    ").await?.collect().await?;
+
+    ctx.sql("CREATE TABLE customers (customer_id INT, name VARCHAR, nation_id INT) AS VALUES
+        (1, 'Anna', 1),
+        (2, 'Bob', 2),
+        (3, 'Chen', 1)
+    ").await?.collect().await?;
+
+    ctx.sql("CREATE TABLE nations (nation_id INT, nation_name VARCHAR) AS VALUES
+        (1, 'Germany'),
+        (2, 'France')
+    ").await?.collect().await?;
+
+    let df = ctx.sql("
+        SELECT o.order_id, c.name, n.nation_name, o.amount
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.customer_id
+        JOIN nations n ON c.nation_id = n.nation_id
+        ORDER BY o.order_id
+    ").await?;
+
+    let plan = df.create_physical_plan().await?;
+    println!("{}", datafusion_physical_plan::displayable(plan.as_ref()).indent(true));
+
+    Ok(())
 }
