@@ -35,13 +35,13 @@ use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
 use futures::StreamExt;
-use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 
 use crate::PhysicalOptimizerRule;
 
 // Shared Bloom Filter Handle
 
-type SharedBloom = Arc<Mutex<Option<Bloom<String>>>>;
+type SharedBloom = Arc<broadcast::Sender<Arc<Bloom<String>>>>;
 
 // Rule Struct
 
@@ -92,20 +92,16 @@ fn collect_recursive(plan: &Arc<dyn ExecutionPlan>, edges: &mut Vec<JoinEdge>) {
 pub struct BloomFilterBuildExec {
     input: Arc<dyn ExecutionPlan>,
     key_column_name: String,
-    bloom: SharedBloom,
+    sender: SharedBloom,
 }
 
 impl BloomFilterBuildExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         key_column_name: String,
-        bloom: SharedBloom,
+        sender: SharedBloom,
     ) -> Self {
-        Self { input, key_column_name, bloom }
-    }
-
-    pub fn bloom(&self) -> SharedBloom {
-        Arc::clone(&self.bloom)
+        Self { input, key_column_name, sender }
     }
 }
 
@@ -143,7 +139,7 @@ impl ExecutionPlan for BloomFilterBuildExec {
         Ok(Arc::new(BloomFilterBuildExec::new(
             Arc::clone(&children[0]),
             self.key_column_name.clone(),
-            Arc::clone(&self.bloom),
+            Arc::clone(&self.sender),
         )))
     }
 
@@ -158,41 +154,47 @@ impl ExecutionPlan for BloomFilterBuildExec {
             .iter()
             .position(|f| f.name() == &self.key_column_name)
             .ok_or_else(|| DataFusionError::Plan(
-                format!("BloomFilterBuildExec: column '{}' not found in schema", self.key_column_name)
+                format!("BloomFilterBuildExec: Column '{}' Not Found", self.key_column_name)
             ))?;
 
         let mut input_stream = self.input.execute(partition, context)?;
-        let bloom = Arc::clone(&self.bloom);
+        let sender = Arc::clone(&self.sender);
         let schema_ref = self.input.schema();
 
         let output_stream = async_stream::stream! {
+            let mut all_values: Vec<String> = Vec::new();
+            let mut batches: Vec<RecordBatch> = Vec::new();
+
             while let Some(batch_result) = input_stream.next().await {
                 let batch: RecordBatch = match batch_result {
                     Ok(b) => b,
-                    Err(e) => { yield Err(e); continue; }
+                    Err(e) => { yield Err(e); return; }
                 };
 
                 let col = batch.column(key_column);
-                let values: Vec<String> = if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
-                    (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i).to_string()).collect()
+                if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                    }
                 } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                    (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i).to_string()).collect()
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                    }
                 } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                    (0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i).to_string()).collect()
-                } else {
-                    vec![]
-                };
-
-                {
-                    let mut guard = bloom.lock().await;
-                    let bf = guard.get_or_insert_with(|| {
-                        Bloom::new_for_fp_rate(100_000, 0.01).unwrap()
-                    });
-                    for v in &values {
-                        bf.set(v);
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
                     }
                 }
+                batches.push(batch);
+            }
 
+            let mut bf = Bloom::new_for_fp_rate(all_values.len().max(1), 0.01).unwrap();
+            for v in &all_values {
+                bf.set(v);
+            }
+            let _ = sender.send(Arc::new(bf));
+
+            for batch in batches {
                 yield Ok(batch);
             }
         };
@@ -214,16 +216,16 @@ impl ExecutionPlan for BloomFilterBuildExec {
 pub struct BloomFilterProbeExec {
     input: Arc<dyn ExecutionPlan>,
     key_column_name: String,
-    bloom: SharedBloom,
+    sender: SharedBloom,
 }
 
 impl BloomFilterProbeExec {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         key_column_name: String,
-        bloom: SharedBloom,
+        sender: SharedBloom,
     ) -> Self {
-        Self { input, key_column_name, bloom }
+        Self { input, key_column_name, sender }
     }
 }
 
@@ -261,7 +263,7 @@ impl ExecutionPlan for BloomFilterProbeExec {
         Ok(Arc::new(BloomFilterProbeExec::new(
             Arc::clone(&children[0]),
             self.key_column_name.clone(),
-            Arc::clone(&self.bloom),
+            Arc::clone(&self.sender),
         )))
     }
 
@@ -276,15 +278,28 @@ impl ExecutionPlan for BloomFilterProbeExec {
             .iter()
             .position(|f| f.name() == &self.key_column_name)
             .ok_or_else(|| DataFusionError::Plan(
-                format!("BloomFilterProbeExec: column '{}' not found in schema", self.key_column_name)
+                format!("BloomFilterProbeExec: Column '{}' Not Found", self.key_column_name)
             ))?;
 
         let mut input_stream = self.input.execute(partition, context)?;
-        let bloom = Arc::clone(&self.bloom);
+        let mut receiver = self.sender.subscribe();
         let schema_ref = self.input.schema();
         let key_column_name = self.key_column_name.clone();
 
         let output_stream = async_stream::stream! {
+            let bf = match receiver.recv().await {
+                Ok(b) => b,
+                Err(_) => {
+                    while let Some(batch_result) = input_stream.next().await {
+                        match batch_result {
+                            Ok(b) => yield Ok(b),
+                            Err(e) => yield Err(e),
+                        }
+                    }
+                    return;
+                }
+            };
+
             while let Some(batch_result) = input_stream.next().await {
                 let batch: RecordBatch = match batch_result {
                     Ok(b) => b,
@@ -292,30 +307,22 @@ impl ExecutionPlan for BloomFilterProbeExec {
                 };
 
                 let col = batch.column(key_column);
-
-                let keep: Vec<bool> = {
-                    let guard = bloom.lock().await;
-                    if let Some(bf) = guard.as_ref() {
-                        (0..col.len()).map(|i| {
-                            if col.is_null(i) {
-                                false
-                            } else {
-                                let val = if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
-                                    arr.value(i).to_string()
-                                } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                                    arr.value(i).to_string()
-                                } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                                    arr.value(i).to_string()
-                                } else {
-                                    return true;
-                                };
-                                bf.check(&val)
-                            }
-                        }).collect()
+                let keep: Vec<bool> = (0..col.len()).map(|i| {
+                    if col.is_null(i) {
+                        false
                     } else {
-                        vec![true; col.len()]
+                        let val = if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                            arr.value(i).to_string()
+                        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                            arr.value(i).to_string()
+                        } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                            arr.value(i).to_string()
+                        } else {
+                            return true;
+                        };
+                        bf.check(&val)
                     }
-                };
+                }).collect();
 
                 let rows_before = batch.num_rows();
                 let mask = BooleanArray::from(keep);
@@ -325,10 +332,8 @@ impl ExecutionPlan for BloomFilterProbeExec {
                         let eliminated = rows_before - rows_after;
                         if eliminated > 0 {
                             println!(
-                                "  [BloomFilterProbeExec] col='{}' eliminated {}/{} rows ({:.1}%)",
-                                key_column_name,
-                                eliminated,
-                                rows_before,
+                                "[BloomFilterProbeExec] col='{}' Eliminated {}/{} Rows ({:.1}%)",
+                                key_column_name, eliminated, rows_before,
                                 (eliminated as f64 / rows_before as f64) * 100.0
                             );
                         }
@@ -393,22 +398,23 @@ fn insert_bloom_filters(
                 if let (Some(left_field_name), Some(right_field_name)) =
                     (left_field_name, right_field_name)
                 {
-                    let shared_bloom: SharedBloom = Arc::new(Mutex::new(None));
+                    let (sender, _) = broadcast::channel(1);
+                    let sender = Arc::new(sender);
 
                     new_left = Arc::new(BloomFilterBuildExec::new(
                         new_left,
                         left_field_name.clone(),
-                        Arc::clone(&shared_bloom),
+                        Arc::clone(&sender),
                     ));
 
                     new_right = Arc::new(BloomFilterProbeExec::new(
                         new_right,
                         right_field_name.clone(),
-                        Arc::clone(&shared_bloom),
+                        Arc::clone(&sender),
                     ));
 
                     println!(
-                        "  inserted BF: build on col '{}', probe on col '{}'",
+                        "Inserted BF: Build On Col '{}', Probe On Col '{}'",
                         left_field_name, right_field_name
                     );
                 }
@@ -442,7 +448,7 @@ impl PhysicalOptimizerRule for MultiHopBloomFilterRule {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let edges = collect_join_edges(&plan);
 
-        println!("MultiHopBloomFilterRule: found {} join edge(s)", edges.len());
+        println!("MultiHopBloomFilterRule: Found {} Join Edge(s)", edges.len());
         for edge in &edges {
             println!("  edge: {} = {}", edge.left_col, edge.right_col);
         }
