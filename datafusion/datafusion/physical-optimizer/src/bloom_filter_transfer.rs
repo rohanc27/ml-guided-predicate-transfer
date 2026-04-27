@@ -18,7 +18,10 @@
 //! Multi-hop predicate transfer via runtime Bloom filters.
 
 use std::any::Any;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
@@ -42,6 +45,72 @@ use crate::PhysicalOptimizerRule;
 // Shared Bloom Filter Handle
 
 type SharedBloom = Arc<broadcast::Sender<Arc<Bloom<String>>>>;
+
+// Execution Metrics
+
+#[derive(Debug)]
+pub struct FilterMetrics {
+    pub query_id: String,
+    pub col_name: String,
+    pub build_cardinality: usize,
+    pub distinct_estimate: usize,
+    pub filter_size_bytes: usize,
+    pub build_time_ms: f64,
+    pub probe_batches: usize,
+    pub rows_in: usize,
+    pub rows_out: usize,
+    pub rows_eliminated: usize,
+    pub probe_time_ms: f64,
+}
+
+impl FilterMetrics {
+    pub fn elimination_rate(&self) -> f64 {
+        if self.rows_in == 0 { return 0.0; }
+        self.rows_eliminated as f64 / self.rows_in as f64
+    }
+
+    pub fn net_benefit_ms(&self) -> f64 {
+        let scan_ms_per_row = 0.001;
+        let saved_ms = self.rows_eliminated as f64 * scan_ms_per_row;
+        saved_ms - self.build_time_ms - self.probe_time_ms
+    }
+
+    pub fn was_beneficial(&self) -> u8 {
+        if self.net_benefit_ms() > 0.0 { 1 } else { 0 }
+    }
+
+    pub fn to_csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{},{:.4},{},{},{},{},{:.4},{:.4},{}\n",
+            self.query_id,
+            self.col_name,
+            self.build_cardinality,
+            self.distinct_estimate,
+            self.filter_size_bytes,
+            self.build_time_ms,
+            self.probe_batches,
+            self.rows_in,
+            self.rows_out,
+            self.rows_eliminated,
+            self.probe_time_ms,
+            self.net_benefit_ms(),
+            self.was_beneficial()
+        )
+    }
+}
+
+pub fn write_metrics(metrics: &FilterMetrics, path: &str) {
+    let write_header = !std::path::Path::new(path).exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    if write_header {
+        writeln!(file, "query_id,col_name,build_cardinality,distinct_estimate,filter_size_bytes,build_time_ms,probe_batches,rows_in,rows_out,rows_eliminated,probe_time_ms,net_benefit_ms,was_beneficial").unwrap();
+    }
+    write!(file, "{}", metrics.to_csv_row()).unwrap();
+}
 
 // Rule Struct
 
@@ -154,14 +223,16 @@ impl ExecutionPlan for BloomFilterBuildExec {
             .iter()
             .position(|f| f.name() == &self.key_column_name)
             .ok_or_else(|| DataFusionError::Plan(
-                format!("BloomFilterBuildExec: Column '{}' Not Found", self.key_column_name)
+                format!("BloomFilterBuildExec: column '{}' not found", self.key_column_name)
             ))?;
 
         let mut input_stream = self.input.execute(partition, context)?;
         let sender = Arc::clone(&self.sender);
         let schema_ref = self.input.schema();
+        let key_column_name = self.key_column_name.clone();
 
         let output_stream = async_stream::stream! {
+            let build_start = Instant::now();
             let mut all_values: Vec<String> = Vec::new();
             let mut batches: Vec<RecordBatch> = Vec::new();
 
@@ -188,11 +259,28 @@ impl ExecutionPlan for BloomFilterBuildExec {
                 batches.push(batch);
             }
 
-            let mut bf = Bloom::new_for_fp_rate(all_values.len().max(1), 0.01).unwrap();
+            let build_cardinality = all_values.len();
+            let distinct_estimate = {
+                let mut seen = std::collections::HashSet::new();
+                for v in &all_values { seen.insert(v.clone()); }
+                seen.len()
+            };
+
+            let mut bf = Bloom::new_for_fp_rate(build_cardinality.max(1), 0.01).unwrap();
             for v in &all_values {
                 bf.set(v);
             }
+            let filter_size_bytes = build_cardinality * 2;
+            let build_time_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+
             let _ = sender.send(Arc::new(bf));
+
+            let csv_path = std::env::var("BF_METRICS_PATH")
+                .unwrap_or_else(|_| "/tmp/bf_metrics.csv".to_string());
+            let build_meta_path = format!("{}.build.{}", csv_path, key_column_name);
+            if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(&build_meta_path) {
+                let _ = writeln!(f, "{},{},{},{:.4}", build_cardinality, distinct_estimate, filter_size_bytes, build_time_ms);
+            }
 
             for batch in batches {
                 yield Ok(batch);
@@ -278,7 +366,7 @@ impl ExecutionPlan for BloomFilterProbeExec {
             .iter()
             .position(|f| f.name() == &self.key_column_name)
             .ok_or_else(|| DataFusionError::Plan(
-                format!("BloomFilterProbeExec: Column '{}' Not Found", self.key_column_name)
+                format!("BloomFilterProbeExec: column '{}' not found", self.key_column_name)
             ))?;
 
         let mut input_stream = self.input.execute(partition, context)?;
@@ -299,6 +387,11 @@ impl ExecutionPlan for BloomFilterProbeExec {
                     return;
                 }
             };
+
+            let probe_start = Instant::now();
+            let mut probe_batches = 0usize;
+            let mut total_rows_in = 0usize;
+            let mut total_rows_out = 0usize;
 
             while let Some(batch_result) = input_stream.next().await {
                 let batch: RecordBatch = match batch_result {
@@ -329,10 +422,13 @@ impl ExecutionPlan for BloomFilterProbeExec {
                 match filter_record_batch(&batch, &mask) {
                     Ok(filtered) => {
                         let rows_after = filtered.num_rows();
+                        total_rows_in += rows_before;
+                        total_rows_out += rows_after;
+                        probe_batches += 1;
                         let eliminated = rows_before - rows_after;
                         if eliminated > 0 {
                             println!(
-                                "[BloomFilterProbeExec] col='{}' Eliminated {}/{} Rows ({:.1}%)",
+                                "[BloomFilterProbeExec] col='{}' eliminated {}/{} rows ({:.1}%)",
                                 key_column_name, eliminated, rows_before,
                                 (eliminated as f64 / rows_before as f64) * 100.0
                             );
@@ -342,6 +438,44 @@ impl ExecutionPlan for BloomFilterProbeExec {
                     Err(e) => yield Err(DataFusionError::ArrowError(Box::new(e), None)),
                 }
             }
+
+            let probe_time_ms = probe_start.elapsed().as_secs_f64() * 1000.0;
+            let rows_eliminated = total_rows_in - total_rows_out;
+
+            let csv_path = std::env::var("BF_METRICS_PATH")
+                .unwrap_or_else(|_| "/tmp/bf_metrics.csv".to_string());
+            let build_meta_path = format!("{}.build.{}", csv_path, key_column_name);
+            let (build_cardinality, distinct_estimate, filter_size_bytes, build_time_ms) =
+                if let Ok(content) = std::fs::read_to_string(&build_meta_path) {
+                    let parts: Vec<&str> = content.trim().split(',').collect();
+                    if parts.len() == 4 {
+                        (
+                            parts[0].parse::<usize>().unwrap_or(0),
+                            parts[1].parse::<usize>().unwrap_or(0),
+                            parts[2].parse::<usize>().unwrap_or(0),
+                            parts[3].parse::<f64>().unwrap_or(0.0),
+                        )
+                    } else { (0, 0, 0, 0.0) }
+                } else { (0, 0, 0, 0.0) };
+
+            let query_id = std::env::var("BF_QUERY_ID")
+                .unwrap_or_else(|_| "unknown".to_string());
+
+            let metrics = FilterMetrics {
+                query_id,
+                col_name: key_column_name.clone(),
+                build_cardinality,
+                distinct_estimate,
+                filter_size_bytes,
+                build_time_ms,
+                probe_batches,
+                rows_in: total_rows_in,
+                rows_out: total_rows_out,
+                rows_eliminated,
+                probe_time_ms,
+            };
+
+            write_metrics(&metrics, &csv_path);
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema_ref, output_stream)))
