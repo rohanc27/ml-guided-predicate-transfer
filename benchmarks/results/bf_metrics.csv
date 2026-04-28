@@ -7,7 +7,6 @@ q2,ps_partkey,747,747,1494,0.0855,0,0,0,0,0.0718,-0.1573,0
 q2,ps_suppkey,10000,10000,20000,9.1834,0,0,0,0,0.4462,-9.6296,0
 q2,s_nationkey,25,25,50,2.6912,0,0,0,0,9.9092,-12.6004,0
 q2,n_regionkey,1,1,2,7.4225,0,0,0,0,12.5204,-19.9429,0
-query_id,col_name,build_cardinality,distinct_estimate,filter_size_bytes,build_time_ms,probe_batches,rows_in,rows_out,rows_eliminated,probe_time_ms,net_benefit_ms,was_beneficial
 q2,ps_partkey,747,747,1494,0.0855,0,0,0,0,0.1586,-0.2441,0
 q2,ps_suppkey,10000,10000,20000,9.1834,0,0,0,0,0.5249,-9.7084,0
 q2,s_nationkey,25,25,50,2.6912,0,0,0,0,9.9566,-12.6477,0
