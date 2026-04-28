@@ -44,7 +44,16 @@ use crate::PhysicalOptimizerRule;
 
 // Shared Bloom Filter Handle
 
-type SharedBloom = Arc<broadcast::Sender<Arc<Bloom<String>>>>;
+#[derive(Debug, Clone)]
+pub struct BloomPayload {
+    pub filter: Arc<Bloom<String>>,
+    pub build_cardinality: usize,
+    pub distinct_estimate: usize,
+    pub filter_size_bytes: usize,
+    pub build_time_ms: f64,
+}
+
+type SharedBloom = Arc<broadcast::Sender<Arc<BloomPayload>>>;
 
 // Execution Metrics
 
@@ -100,7 +109,7 @@ impl FilterMetrics {
 }
 
 pub fn write_metrics(metrics: &FilterMetrics, path: &str) {
-    let write_header = !std::path::Path::new(path).exists();
+    let write_header = !std::path::Path::new(path).exists() || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -273,14 +282,14 @@ impl ExecutionPlan for BloomFilterBuildExec {
             let filter_size_bytes = build_cardinality * 2;
             let build_time_ms = build_start.elapsed().as_secs_f64() * 1000.0;
 
-            let _ = sender.send(Arc::new(bf));
-
-            let csv_path = std::env::var("BF_METRICS_PATH")
-                .unwrap_or_else(|_| "/tmp/bf_metrics.csv".to_string());
-            let build_meta_path = format!("{}.build.{}", csv_path, key_column_name);
-            if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(&build_meta_path) {
-                let _ = writeln!(f, "{},{},{},{:.4}", build_cardinality, distinct_estimate, filter_size_bytes, build_time_ms);
-            }
+            let payload = BloomPayload {
+                filter: Arc::new(bf),
+                build_cardinality,
+                distinct_estimate,
+                filter_size_bytes,
+                build_time_ms,
+            };
+            let _ = sender.send(Arc::new(payload)); 
 
             for batch in batches {
                 yield Ok(batch);
@@ -375,8 +384,8 @@ impl ExecutionPlan for BloomFilterProbeExec {
         let key_column_name = self.key_column_name.clone();
 
         let output_stream = async_stream::stream! {
-            let bf = match receiver.recv().await {
-                Ok(b) => b,
+            let payload = match receiver.recv().await {
+                Ok(p) => p,
                 Err(_) => {
                     while let Some(batch_result) = input_stream.next().await {
                         match batch_result {
@@ -413,7 +422,7 @@ impl ExecutionPlan for BloomFilterProbeExec {
                         } else {
                             return true;
                         };
-                        bf.check(&val)
+                        payload.filter.check(&val)
                     }
                 }).collect();
 
@@ -444,19 +453,10 @@ impl ExecutionPlan for BloomFilterProbeExec {
 
             let csv_path = std::env::var("BF_METRICS_PATH")
                 .unwrap_or_else(|_| "/tmp/bf_metrics.csv".to_string());
-            let build_meta_path = format!("{}.build.{}", csv_path, key_column_name);
-            let (build_cardinality, distinct_estimate, filter_size_bytes, build_time_ms) =
-                if let Ok(content) = std::fs::read_to_string(&build_meta_path) {
-                    let parts: Vec<&str> = content.trim().split(',').collect();
-                    if parts.len() == 4 {
-                        (
-                            parts[0].parse::<usize>().unwrap_or(0),
-                            parts[1].parse::<usize>().unwrap_or(0),
-                            parts[2].parse::<usize>().unwrap_or(0),
-                            parts[3].parse::<f64>().unwrap_or(0.0),
-                        )
-                    } else { (0, 0, 0, 0.0) }
-                } else { (0, 0, 0, 0.0) };
+            let build_cardinality = payload.build_cardinality;
+            let distinct_estimate = payload.distinct_estimate;
+            let filter_size_bytes = payload.filter_size_bytes;
+            let build_time_ms = payload.build_time_ms;
 
             let query_id = std::env::var("BF_QUERY_ID")
                 .unwrap_or_else(|_| "unknown".to_string());
