@@ -42,6 +42,8 @@ recursive_protection = ["dep:recursive"]
 
 [dependencies]
 arrow = { workspace = true }
+async-stream = "0.3.6"
+bloomfilter = "3.0.1"
 datafusion-common = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
@@ -50,9 +52,11 @@ datafusion-physical-expr = { workspace = true }
 datafusion-physical-expr-common = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-pruning = { workspace = true }
+futures.workspace = true
 itertools = { workspace = true }
 log.workspace = true
 recursive = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 datafusion-expr = { workspace = true }

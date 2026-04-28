@@ -16,23 +16,113 @@
 // under the License.
 
 //! Multi-hop predicate transfer via runtime Bloom filters.
-//! This optimizer rule finds inner equi-joins in the physical plan,
-//! discovers which Bloom filters can be propagated across multiple
-//! join edges, and inserts BloomFilterBuildExec / BloomFilterProbeExec
-//! operators so that table scans can pre-filter rows before joining.
 
+use std::any::Any;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
+use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringArray};
+use arrow::compute::filter_record_batch;
+use arrow::record_batch::RecordBatch;
+use bloomfilter::Bloom;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::Result;
-use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_physical_plan::ExecutionPlan;
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::{DataFusionError, JoinType, Result};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::joins::HashJoinExec;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+};
+use futures::StreamExt;
+use tokio::sync::broadcast;
 
 use crate::PhysicalOptimizerRule;
-use log::debug;
+
+// Shared Bloom Filter Handle
+
+#[derive(Debug, Clone)]
+pub struct BloomPayload {
+    pub filter: Arc<Bloom<String>>,
+    pub build_cardinality: usize,
+    pub distinct_estimate: usize,
+    pub filter_size_bytes: usize,
+    pub build_time_ms: f64,
+}
+
+type SharedBloom = Arc<broadcast::Sender<Arc<BloomPayload>>>;
+
+// Execution Metrics
+
+#[derive(Debug)]
+pub struct FilterMetrics {
+    pub query_id: String,
+    pub col_name: String,
+    pub build_cardinality: usize,
+    pub distinct_estimate: usize,
+    pub filter_size_bytes: usize,
+    pub build_time_ms: f64,
+    pub probe_batches: usize,
+    pub rows_in: usize,
+    pub rows_out: usize,
+    pub rows_eliminated: usize,
+    pub probe_time_ms: f64,
+}
+
+impl FilterMetrics {
+    pub fn elimination_rate(&self) -> f64 {
+        if self.rows_in == 0 { return 0.0; }
+        self.rows_eliminated as f64 / self.rows_in as f64
+    }
+
+    pub fn net_benefit_ms(&self) -> f64 {
+        let scan_ms_per_row = 0.001;
+        let saved_ms = self.rows_eliminated as f64 * scan_ms_per_row;
+        saved_ms - self.build_time_ms - self.probe_time_ms
+    }
+
+    pub fn was_beneficial(&self) -> u8 {
+        if self.net_benefit_ms() > 0.0 { 1 } else { 0 }
+    }
+
+    pub fn to_csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{},{:.4},{},{},{},{},{:.4},{:.4},{}\n",
+            self.query_id,
+            self.col_name,
+            self.build_cardinality,
+            self.distinct_estimate,
+            self.filter_size_bytes,
+            self.build_time_ms,
+            self.probe_batches,
+            self.rows_in,
+            self.rows_out,
+            self.rows_eliminated,
+            self.probe_time_ms,
+            self.net_benefit_ms(),
+            self.was_beneficial()
+        )
+    }
+}
+
+pub fn write_metrics(metrics: &FilterMetrics, path: &str) {
+    let write_header = !std::path::Path::new(path).exists() || std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    if write_header {
+        writeln!(file, "query_id,col_name,build_cardinality,distinct_estimate,filter_size_bytes,build_time_ms,probe_batches,rows_in,rows_out,rows_eliminated,probe_time_ms,net_benefit_ms,was_beneficial").unwrap();
+    }
+    write!(file, "{}", metrics.to_csv_row()).unwrap();
+}
 
 // Rule Struct
+
 #[derive(Default, Debug)]
 pub struct MultiHopBloomFilterRule {}
 
@@ -42,7 +132,8 @@ impl MultiHopBloomFilterRule {
     }
 }
 
-// Core Data Structures
+// JoinEdge
+
 #[derive(Debug, Clone)]
 pub struct JoinEdge {
     pub left_col: String,
@@ -50,6 +141,7 @@ pub struct JoinEdge {
 }
 
 // Join Graph Collection
+
 pub fn collect_join_edges(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinEdge> {
     let mut edges = Vec::new();
     collect_recursive(plan, &mut edges);
@@ -58,21 +150,430 @@ pub fn collect_join_edges(plan: &Arc<dyn ExecutionPlan>) -> Vec<JoinEdge> {
 
 fn collect_recursive(plan: &Arc<dyn ExecutionPlan>, edges: &mut Vec<JoinEdge>) {
     if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
-        if *hash_join.join_type() == datafusion_common::JoinType::Inner {
+        if *hash_join.join_type() == JoinType::Inner {
             for (left_expr, right_expr) in hash_join.on() {
-                let left_col = format!("{}", left_expr);
-                let right_col = format!("{}", right_expr);
-                edges.push(JoinEdge { left_col, right_col });
+                edges.push(JoinEdge {
+                    left_col: format!("{}", left_expr),
+                    right_col: format!("{}", right_expr),
+                });
             }
         }
     }
-
     for child in plan.children() {
         collect_recursive(child, edges);
     }
 }
 
+// BloomFilterBuildExec
+
+#[derive(Debug)]
+pub struct BloomFilterBuildExec {
+    input: Arc<dyn ExecutionPlan>,
+    key_column_name: String,
+    sender: SharedBloom,
+}
+
+impl BloomFilterBuildExec {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        key_column_name: String,
+        sender: SharedBloom,
+    ) -> Self {
+        Self { input, key_column_name, sender }
+    }
+}
+
+impl DisplayAs for BloomFilterBuildExec {
+    fn fmt_as(
+        &self,
+        _t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "BloomFilterBuildExec: key_col={}", self.key_column_name)
+    }
+}
+
+impl ExecutionPlan for BloomFilterBuildExec {
+    fn name(&self) -> &'static str {
+        "BloomFilterBuildExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(BloomFilterBuildExec::new(
+            Arc::clone(&children[0]),
+            self.key_column_name.clone(),
+            Arc::clone(&self.sender),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = self.input.schema();
+        let key_column = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == &self.key_column_name)
+            .ok_or_else(|| DataFusionError::Plan(
+                format!("BloomFilterBuildExec: column '{}' not found", self.key_column_name)
+            ))?;
+
+        let mut input_stream = self.input.execute(partition, context)?;
+        let sender = Arc::clone(&self.sender);
+        let schema_ref = self.input.schema();
+        let key_column_name = self.key_column_name.clone();
+
+        let output_stream = async_stream::stream! {
+            let build_start = Instant::now();
+            let mut all_values: Vec<String> = Vec::new();
+            let mut batches: Vec<RecordBatch> = Vec::new();
+
+            while let Some(batch_result) = input_stream.next().await {
+                let batch: RecordBatch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => { yield Err(e); return; }
+                };
+
+                let col = batch.column(key_column);
+                if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                    }
+                } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                    }
+                } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) { all_values.push(arr.value(i).to_string()); }
+                    }
+                }
+                batches.push(batch);
+            }
+
+            let build_cardinality = all_values.len();
+            let distinct_estimate = {
+                let mut seen = std::collections::HashSet::new();
+                for v in &all_values { seen.insert(v.clone()); }
+                seen.len()
+            };
+
+            let mut bf = Bloom::new_for_fp_rate(build_cardinality.max(1), 0.01).unwrap();
+            for v in &all_values {
+                bf.set(v);
+            }
+            let filter_size_bytes = build_cardinality * 2;
+            let build_time_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+
+            let payload = BloomPayload {
+                filter: Arc::new(bf),
+                build_cardinality,
+                distinct_estimate,
+                filter_size_bytes,
+                build_time_ms,
+            };
+            let _ = sender.send(Arc::new(payload)); 
+
+            for batch in batches {
+                yield Ok(batch);
+            }
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema_ref, output_stream)))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+}
+
+// BloomFilterProbeExec
+
+#[derive(Debug)]
+pub struct BloomFilterProbeExec {
+    input: Arc<dyn ExecutionPlan>,
+    key_column_name: String,
+    sender: SharedBloom,
+}
+
+impl BloomFilterProbeExec {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        key_column_name: String,
+        sender: SharedBloom,
+    ) -> Self {
+        Self { input, key_column_name, sender }
+    }
+}
+
+impl DisplayAs for BloomFilterProbeExec {
+    fn fmt_as(
+        &self,
+        _t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "BloomFilterProbeExec: key_col={}", self.key_column_name)
+    }
+}
+
+impl ExecutionPlan for BloomFilterProbeExec {
+    fn name(&self) -> &'static str {
+        "BloomFilterProbeExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(BloomFilterProbeExec::new(
+            Arc::clone(&children[0]),
+            self.key_column_name.clone(),
+            Arc::clone(&self.sender),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = self.input.schema();
+        let key_column = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == &self.key_column_name)
+            .ok_or_else(|| DataFusionError::Plan(
+                format!("BloomFilterProbeExec: column '{}' not found", self.key_column_name)
+            ))?;
+
+        let mut input_stream = self.input.execute(partition, context)?;
+        let mut receiver = self.sender.subscribe();
+        let schema_ref = self.input.schema();
+        let key_column_name = self.key_column_name.clone();
+
+        let output_stream = async_stream::stream! {
+            let payload = match receiver.recv().await {
+                Ok(p) => p,
+                Err(_) => {
+                    while let Some(batch_result) = input_stream.next().await {
+                        match batch_result {
+                            Ok(b) => yield Ok(b),
+                            Err(e) => yield Err(e),
+                        }
+                    }
+                    return;
+                }
+            };
+
+            let probe_start = Instant::now();
+            let mut probe_batches = 0usize;
+            let mut total_rows_in = 0usize;
+            let mut total_rows_out = 0usize;
+
+            while let Some(batch_result) = input_stream.next().await {
+                let batch: RecordBatch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => { yield Err(e); continue; }
+                };
+
+                let col = batch.column(key_column);
+                let keep: Vec<bool> = (0..col.len()).map(|i| {
+                    if col.is_null(i) {
+                        false
+                    } else {
+                        let val = if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                            arr.value(i).to_string()
+                        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                            arr.value(i).to_string()
+                        } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                            arr.value(i).to_string()
+                        } else {
+                            return true;
+                        };
+                        payload.filter.check(&val)
+                    }
+                }).collect();
+
+                let rows_before = batch.num_rows();
+                let mask = BooleanArray::from(keep);
+                match filter_record_batch(&batch, &mask) {
+                    Ok(filtered) => {
+                        let rows_after = filtered.num_rows();
+                        total_rows_in += rows_before;
+                        total_rows_out += rows_after;
+                        probe_batches += 1;
+                        let eliminated = rows_before - rows_after;
+                        if eliminated > 0 {
+                            println!(
+                                "[BloomFilterProbeExec] col='{}' eliminated {}/{} rows ({:.1}%)",
+                                key_column_name, eliminated, rows_before,
+                                (eliminated as f64 / rows_before as f64) * 100.0
+                            );
+                        }
+                        yield Ok(filtered)
+                    },
+                    Err(e) => yield Err(DataFusionError::ArrowError(Box::new(e), None)),
+                }
+            }
+
+            let probe_time_ms = probe_start.elapsed().as_secs_f64() * 1000.0;
+            let rows_eliminated = total_rows_in - total_rows_out;
+
+            let csv_path = std::env::var("BF_METRICS_PATH")
+                .unwrap_or_else(|_| "/tmp/bf_metrics.csv".to_string());
+            let build_cardinality = payload.build_cardinality;
+            let distinct_estimate = payload.distinct_estimate;
+            let filter_size_bytes = payload.filter_size_bytes;
+            let build_time_ms = payload.build_time_ms;
+
+            let query_id = std::env::var("BF_QUERY_ID")
+                .unwrap_or_else(|_| "unknown".to_string());
+
+            let metrics = FilterMetrics {
+                query_id,
+                col_name: key_column_name.clone(),
+                build_cardinality,
+                distinct_estimate,
+                filter_size_bytes,
+                build_time_ms,
+                probe_batches,
+                rows_in: total_rows_in,
+                rows_out: total_rows_out,
+                rows_eliminated,
+                probe_time_ms,
+            };
+
+            write_metrics(&metrics, &csv_path);
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema_ref, output_stream)))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+}
+
+// Plan Rewriting
+
+fn insert_bloom_filters(
+    plan: Arc<dyn ExecutionPlan>,
+    edges: &[JoinEdge],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if edges.is_empty() {
+        return Ok(plan);
+    }
+
+    if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if *hash_join.join_type() == JoinType::Inner {
+            let left = Arc::clone(hash_join.left());
+            let right = Arc::clone(hash_join.right());
+
+            let left = insert_bloom_filters(left, edges)?;
+            let right = insert_bloom_filters(right, edges)?;
+
+            let mut new_left = left;
+            let mut new_right = right;
+
+            for (join_left_expr, join_right_expr) in hash_join.on() {
+                let left_col_name = format!("{}", join_left_expr);
+                let right_col_name = format!("{}", join_right_expr);
+
+                let left_schema = new_left.schema();
+                let right_schema = new_right.schema();
+
+                let left_field_name = left_schema
+                    .fields()
+                    .iter()
+                    .find(|f| left_col_name.contains(f.name()))
+                    .map(|f| f.name().clone());
+
+                let right_field_name = right_schema
+                    .fields()
+                    .iter()
+                    .find(|f| right_col_name.contains(f.name()))
+                    .map(|f| f.name().clone());
+
+                if let (Some(left_field_name), Some(right_field_name)) =
+                    (left_field_name, right_field_name)
+                {
+                    let (sender, _) = broadcast::channel(1);
+                    let sender = Arc::new(sender);
+
+                    new_left = Arc::new(BloomFilterBuildExec::new(
+                        new_left,
+                        left_field_name.clone(),
+                        Arc::clone(&sender),
+                    ));
+
+                    new_right = Arc::new(BloomFilterProbeExec::new(
+                        new_right,
+                        right_field_name.clone(),
+                        Arc::clone(&sender),
+                    ));
+
+                    println!(
+                        "Inserted BF: Build On Col '{}', Probe On Col '{}'",
+                        left_field_name, right_field_name
+                    );
+                }
+            }
+
+            let new_plan = plan.with_new_children(vec![new_left, new_right])?;
+            return Ok(new_plan);
+        }
+    }
+
+    let children = plan.children();
+    if children.is_empty() {
+        return Ok(plan);
+    }
+
+    let new_children = children
+        .into_iter()
+        .map(|c| insert_bloom_filters(Arc::clone(c), edges))
+        .collect::<Result<Vec<_>>>()?;
+
+    plan.with_new_children(new_children)
+}
+
 // Optimizer Rule Implementation
+
 impl PhysicalOptimizerRule for MultiHopBloomFilterRule {
     fn optimize(
         &self,
@@ -81,15 +582,16 @@ impl PhysicalOptimizerRule for MultiHopBloomFilterRule {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let edges = collect_join_edges(&plan);
 
-        debug!(
-            "MultiHopBloomFilterRule: found {} join edge(s)",
-            edges.len()
-        );
+        println!("MultiHopBloomFilterRule: Found {} Join Edge(s)", edges.len());
         for edge in &edges {
-            debug!("  edge: {} = {}", edge.left_col, edge.right_col);
+            println!("  edge: {} = {}", edge.left_col, edge.right_col);
         }
 
-        plan.transform_up(|node| Ok(Transformed::no(node))).map(|t| t.data)
+        if edges.is_empty() {
+            return Ok(plan);
+        }
+
+        insert_bloom_filters(plan, &edges)
     }
 
     fn name(&self) -> &str {
@@ -102,6 +604,7 @@ impl PhysicalOptimizerRule for MultiHopBloomFilterRule {
 }
 
 // Tests
+
 #[cfg(test)]
 mod tests {
     use super::*;
