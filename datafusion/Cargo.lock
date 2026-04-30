@@ -2480,6 +2480,8 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "recursive",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

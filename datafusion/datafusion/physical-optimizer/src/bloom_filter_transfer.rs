@@ -272,7 +272,7 @@ impl ExecutionPlan for BloomFilterBuildExec {
 
             let build_cardinality = all_values.len();
             let distinct_estimate = {
-                let mut seen = std::collections::HashSet::new();
+                let mut seen = HashSet::new();
                 for v in &all_values { seen.insert(v.clone()); }
                 seen.len()
             };
@@ -582,12 +582,10 @@ fn insert_bloom_filters(
 fn extract_features(build_side: &Arc<dyn ExecutionPlan>) -> [f64; 5] {
     const FALLBACK: f64 = 10_000.0;
 
-    let build_cardinality = build_side
-        .statistics()
-        .ok()
-        .and_then(|s| s.num_rows.get_value().copied())
-        .map(|n| n as f64)
-        .unwrap_or(FALLBACK);
+    let build_cardinality = match build_side.partition_statistics(None) {
+        Ok(stats) => stats.num_rows.get_value().copied().unwrap_or(10_000) as f64,
+        Err(_) => FALLBACK,
+    };
 
     // Heuristic: assume 80% distinct values when statistics are absent.
     let distinct_estimate = build_cardinality * 0.8;
