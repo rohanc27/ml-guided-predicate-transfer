@@ -73,3 +73,5 @@ secrets.toml
 *.tmp
 *.bak
 *.orig
+# Claude Code worktrees and metadata
+.claude/
